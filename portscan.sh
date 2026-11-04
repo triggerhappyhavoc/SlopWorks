@@ -11,10 +11,15 @@
 #     because -w means "idle timeout" on some flavours and "connect timeout"
 #     on others.
 #
-# Requires bash 4.0+, coreutils, awk, xargs and getent. If no netcat is
-# installed, it falls back to bash's built-in /dev/tcp.
+# Requires bash 4.0+, coreutils, awk, xargs and getent. A static `nc` binary
+# placed in the directory the script is called from is preferred over any nc on
+# PATH (handy on locked-down targets with no netcat, or an incompatible libc).
+# If no netcat is found at all, it falls back to bash's built-in /dev/tcp.
 
 PROG=${0##*/}
+# Directory the script was invoked from. A static nc dropped here is preferred
+# over system netcat; captured once up front since the script never chdir's.
+CALLDIR=$PWD
 TIMEOUT=2           # seconds allowed for a connect, and for each banner read
 JOBS=50             # concurrent probes
 MAX_HOSTS=65536     # largest target list accepted (a /16)
@@ -170,7 +175,18 @@ add_target() {
 }
 
 find_nc() {
-    NC=$(command -v nc || command -v ncat || command -v netcat)
+    # Prefer a static nc shipped alongside the invocation (absolute path, so the
+    # xargs worker shells resolve it regardless of their own working directory).
+    local local_nc="$CALLDIR/nc"
+    if [[ -x $local_nc ]]; then
+        NC=$local_nc
+        warn "using static nc from working directory: $NC"
+    elif [[ -e $local_nc ]]; then
+        warn "found $local_nc but it is not executable; run 'chmod +x nc' to use it"
+        NC=$(command -v nc || command -v ncat || command -v netcat)
+    else
+        NC=$(command -v nc || command -v ncat || command -v netcat)
+    fi
     if [[ -z $NC ]]; then
         warn "nc not found, falling back to bash /dev/tcp" \
             "(install with: apt-get install netcat-openbsd, or dnf install nmap-ncat)"
