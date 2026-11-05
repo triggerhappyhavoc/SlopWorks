@@ -63,8 +63,16 @@ Examples:
 EOF
 }
 
-warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
-die()  { warn "$*"; exit 2; }
+# First argument is the message; any further arguments are printed as indented
+# continuation lines rather than being mashed onto one line.
+warn() {
+    printf '%s: %s\n' "$PROG" "$1" >&2
+    shift
+    (($#)) && printf '  %s\n' "$@" >&2
+    return 0
+}
+die()  { warn "$@"; exit 2; }
+have() { command -v "$1" >/dev/null 2>&1; }
 
 # Print each number in a spec such as "1,3,7-9", rejecting anything outside
 # min..max. Shared by port lists and IP octets.
@@ -106,6 +114,10 @@ ip_to_int() {
 add_int_range() {
     local first=$1 last=$2 i
 
+    # Reject an over-broad block up front instead of enumerating tens of
+    # thousands of addresses only to abort partway through add_host.
+    (( last - first + 1 <= MAX_HOSTS )) ||
+        die "target range covers $((last - first + 1)) addresses (limit is $MAX_HOSTS, a /16)"
     for ((i = first; i <= last; i++)); do
         add_host "$((i >> 24 & 255)).$((i >> 16 & 255)).$((i >> 8 & 255)).$((i & 255))"
     done
@@ -138,10 +150,32 @@ add_octets() {
     done
 }
 
+# Resolve a hostname to its first IPv4 address. Tries several tools so this
+# works beyond glibc/getent (e.g. musl/Alpine, where 'getent ahostsv4' may be
+# absent or empty): getent, then python3, host, dig.
+resolve_ipv4() {
+    local name=$1 ip=
+
+    if have getent; then
+        ip=$(getent ahostsv4 "$name" 2>/dev/null | awk 'NR == 1 { print $1 }')
+        [[ -n $ip ]] || ip=$(getent hosts "$name" 2>/dev/null | awk 'NR == 1 { print $1 }')
+    fi
+    [[ -z $ip ]] && have python3 && ip=$(python3 -c \
+        'import socket,sys
+try: print(socket.getaddrinfo(sys.argv[1],None,socket.AF_INET)[0][4][0])
+except Exception: pass' "$name" 2>/dev/null)
+    [[ -z $ip ]] && have host && ip=$(host -t A "$name" 2>/dev/null |
+        awk '/has address/ { print $NF; exit }')
+    [[ -z $ip ]] && have dig && ip=$(dig +short A "$name" 2>/dev/null |
+        awk '/^[0-9.]+$/ { print; exit }')
+
+    [[ $ip =~ ^$IPV4$ ]] && printf '%s\n' "$ip"
+}
+
 add_hostname() {
     local name=$1 ip
 
-    ip=$(getent ahostsv4 "$name" 2>/dev/null | awk 'NR == 1 { print $1 }')
+    ip=$(resolve_ipv4 "$name")
     if [[ -z $ip ]]; then
         warn "could not resolve '$name', skipping"
         return 0
@@ -175,24 +209,38 @@ add_target() {
 }
 
 find_nc() {
-    # Prefer a static nc shipped alongside the invocation (absolute path, so the
+    # Prefer a static nc shipped alongside the script (absolute path, so the
     # xargs worker shells resolve it regardless of their own working directory).
-    local local_nc="$CALLDIR/nc"
+    # Typical use: a netcat 1.10 build from github.com/H74N/netcat-binaries
+    # dropped in beside portscan.sh and renamed to 'nc'.
+    local local_nc="$CALLDIR/nc" probe
     if [[ -x $local_nc ]]; then
-        NC=$local_nc
-        warn "using static nc from working directory: $NC"
+        # Confirm it actually executes as netcat. A wrong-arch binary (the repo
+        # ships both nc32 and nc64) keeps its +x bit but fails to exec, which
+        # would otherwise be mistaken for a flavour without -z and silently make
+        # every port read "closed". Its usage/help text identifies a real nc.
+        probe=$("$local_nc" -h </dev/null 2>&1)
+        if grep -qiE 'listen|zero-i/o|\[-options\]|usage' <<<"$probe"; then
+            NC=$local_nc
+            warn "using static nc from working directory: $NC"
+        else
+            warn "found $local_nc but it did not run as netcat" \
+                 "(wrong architecture? the repo ships separate nc32/nc64); ignoring it"
+        fi
     elif [[ -e $local_nc ]]; then
         warn "found $local_nc but it is not executable; run 'chmod +x nc' to use it"
-        NC=$(command -v nc || command -v ncat || command -v netcat)
-    else
-        NC=$(command -v nc || command -v ncat || command -v netcat)
     fi
+    [[ -n $NC ]] || NC=$(command -v nc || command -v ncat || command -v netcat)
     if [[ -z $NC ]]; then
         warn "nc not found, falling back to bash /dev/tcp" \
             "(install with: apt-get install netcat-openbsd, or dnf install nmap-ncat)"
         return 0
     fi
-    if "$NC" -h </dev/null 2>&1 | grep -q -- '-z'; then
+    # netcat 1.10 and OpenBSD nc advertise -z (zero-I/O scan); old ncat (RHEL 7)
+    # does not, so use --send-only there instead.
+    if [[ -n $probe ]] && [[ $NC == "$local_nc" ]]; then
+        grep -q -- '-z' <<<"$probe" && NC_CONNECT_FLAG=-z || NC_CONNECT_FLAG=--send-only
+    elif "$NC" -h </dev/null 2>&1 | grep -q -- '-z'; then
         NC_CONNECT_FLAG=-z
     else
         NC_CONNECT_FLAG=--send-only
@@ -214,13 +262,16 @@ port_is_open() {
 # bash's printf flushes at each newline, so the payload goes through cat to reach
 # the socket as one write rather than in fragments.
 read_service() {
-    local ip=$1 port=$2 payload=$3
+    local ip=$1 port=$2 payload=$3 read_to=${4:-$TIMEOUT}
 
+    # -w keeps the connection readable for the final net reads after our payload
+    # EOFs, so no background 'sleep' is needed to hold the socket open (that only
+    # left a process lingering until the timeout elapsed).
     if [[ -n $NC ]]; then
-        timeout "$TIMEOUT" "$NC" -n -w "$TIMEOUT" "$ip" "$port" \
-            < <(printf '%b' "$payload" | cat; sleep "$TIMEOUT") 2>/dev/null
+        timeout "$read_to" "$NC" -n -w "$read_to" "$ip" "$port" \
+            < <(printf '%b' "$payload" | cat) 2>/dev/null
     else
-        timeout "$TIMEOUT" bash -c \
+        timeout "$read_to" bash -c \
             'exec 3<>"/dev/tcp/$0/$1"; printf "%b" "$2" | cat >&3; cat <&3' \
             "$ip" "$port" "$payload" 2>/dev/null
     fi
@@ -244,13 +295,17 @@ clean_banner() {
 
 # Probe one port. Silent when closed; prints "index<TAB>port<TAB>banner" when open.
 scan_port() {
-    local index=$1 ip=$2 port=$3 banner
+    local index=$1 ip=$2 port=$3 banner greet_to
 
     port_is_open "$ip" "$port" || return 0
 
-    # Most services that announce themselves do so on connect. Only send a probe
-    # to the ones that stay quiet, which covers HTTP servers on any port.
-    banner=$(read_service "$ip" "$port" '' | clean_banner)
+    # Most services that announce themselves do so on connect, within a round
+    # trip. Give that connect-banner read only a short wait (capped at the
+    # configured timeout, so a low -t is honoured and the default 2s is
+    # unchanged); only ports that stay quiet pay the full timeout on the HTTP
+    # probe, which covers HTTP servers on any port.
+    greet_to=$(( TIMEOUT < 2 ? TIMEOUT : 2 ))
+    banner=$(read_service "$ip" "$port" '' "$greet_to" | clean_banner)
     [[ -n $banner ]] || banner=$(read_service "$ip" "$port" "$HTTP_PROBE" | clean_banner)
 
     printf '%s\t%s\t%s\n' "$index" "$port" "$banner"
@@ -283,6 +338,18 @@ print_report() {
 }
 
 port_spec=
+# Honour an explicit "--": everything after it is a target, even if it begins
+# with "-". Split those off here so getopts never tries to parse them.
+post_dd_targets=()
+seen_dd=0
+pre_args=()
+for arg in "$@"; do
+    if ((seen_dd)); then post_dd_targets+=("$arg")
+    elif [[ $arg == -- ]]; then seen_dd=1
+    else pre_args+=("$arg"); fi
+done
+set -- "${pre_args[@]}"
+
 while (($#)); do
     OPTIND=1
     while getopts ':p:t:j:h' opt; do
@@ -301,6 +368,7 @@ while (($#)); do
         shift
     fi
 done
+targets+=("${post_dd_targets[@]}")
 
 if [[ -z $port_spec || ${#targets[@]} -eq 0 ]]; then
     usage >&2
@@ -318,6 +386,11 @@ for target in "${targets[@]}"; do
     add_target "$target"
 done
 ((${#host_ips[@]} > 0)) || die "no targets to scan"
+
+# timeout(1) bounds every probe in both the nc and /dev/tcp paths; without it
+# each probe would fail before touching the socket and every port would read as
+# closed. Fail loudly rather than silently reporting nothing.
+have timeout || die "'timeout' (from coreutils) is required but was not found in PATH"
 
 NC=
 NC_CONNECT_FLAG=
