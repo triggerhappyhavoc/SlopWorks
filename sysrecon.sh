@@ -220,6 +220,145 @@ fi
 dim "highlighted = non-standard/human account with a login shell, or able to elevate (sudoers/privileged group)"
 
 # ===========================================================================
+# 3b. SSH LOGIN ACCESS (which local accounts can log in to THIS host, and how)
+# ===========================================================================
+section "SSH LOGIN ACCESS"
+# Is an SSH server present / listening to accept inbound logins at all?
+if have sshd || [[ -x /usr/sbin/sshd || -x /usr/bin/sshd ]]; then
+    ok "sshd binary present"
+else
+    dim "no sshd binary found - inbound SSH may be unavailable (still analysing any config)"
+fi
+if have ss; then
+    lst=$(ss -tlnp 2>/dev/null | grep -iE 'sshd|:22[[:space:]]')
+    if [[ -n $lst ]]; then hit "an SSH server is LISTENING:"; printf '%s\n' "$lst" | indent
+    else dim "no sshd socket seen in 'ss -tlnp'"; fi
+fi
+
+# Read GLOBAL-scope sshd_config (sshd_config.d/*.conf first, then the main
+# file) and take the first value per keyword, mirroring sshd's first-wins rule
+# with the usual 'Include .../sshd_config.d/*.conf' near the top of the file.
+SSHD_SOURCES=()
+for c in /etc/ssh/sshd_config.d/*.conf /etc/ssh/sshd_config; do
+    [[ -r $c ]] && SSHD_SOURCES+=("$c")
+done
+if (( ${#SSHD_SOURCES[@]} == 0 )); then
+    dim "no readable sshd_config (need root, or no SSH server) - cannot analyse login policy"
+else
+    info "config (first-wins order): ${SSHD_SOURCES[*]}"
+    sshd_global=$(
+        for c in "${SSHD_SOURCES[@]}"; do
+            # Global scope only: stop at the first Match block in each file.
+            awk 'BEGIN{IGNORECASE=1} /^[[:space:]]*match([[:space:]]|$)/{stop=1} !stop{print}' "$c" 2>/dev/null
+        done
+    )
+    match_present=0
+    for c in "${SSHD_SOURCES[@]}"; do grep -qiE '^[[:space:]]*match([[:space:]]|$)' "$c" 2>/dev/null && match_present=1; done
+    sshd_get()      { awk -v k="${1,,}" 'BEGIN{IGNORECASE=1}{if(tolower($1)==k){print $2; exit}}' <<<"$sshd_global"; }
+    sshd_get_list() { awk -v k="${1,,}" 'BEGIN{IGNORECASE=1}{if(tolower($1)==k){for(i=2;i<=NF;i++)print $i}}' <<<"$sshd_global"; }
+
+    pw_auth=$(sshd_get passwordauthentication);     pw_auth=${pw_auth:-yes}
+    pk_auth=$(sshd_get pubkeyauthentication);       pk_auth=${pk_auth:-yes}
+    permit_root=$(sshd_get permitrootlogin);        permit_root=${permit_root:-prohibit-password}
+    empty_pw=$(sshd_get permitemptypasswords);      empty_pw=${empty_pw:-no}
+    auth_methods=$(sshd_get authenticationmethods); auth_methods=${auth_methods:-any}
+    akf=$(sshd_get_list authorizedkeysfile | tr '\n' ' '); akf=${akf:-.ssh/authorized_keys .ssh/authorized_keys2}
+    ALLOW_U=(); ALLOW_G=(); DENY_U=(); DENY_G=()
+    mapfile -t ALLOW_U < <(sshd_get_list allowusers)
+    mapfile -t ALLOW_G < <(sshd_get_list allowgroups)
+    mapfile -t DENY_U  < <(sshd_get_list denyusers)
+    mapfile -t DENY_G  < <(sshd_get_list denygroups)
+
+    sub "effective global policy (Match blocks excluded)"
+    info "PasswordAuthentication=$pw_auth   PubkeyAuthentication=$pk_auth   PermitRootLogin=$permit_root"
+    info "PermitEmptyPasswords=$empty_pw   AuthenticationMethods=$auth_methods"
+    (( ${#ALLOW_U[@]} )) && info "AllowUsers:  ${ALLOW_U[*]}"
+    (( ${#ALLOW_G[@]} )) && info "AllowGroups: ${ALLOW_G[*]}"
+    (( ${#DENY_U[@]} ))  && info "DenyUsers:   ${DENY_U[*]}"
+    (( ${#DENY_G[@]} ))  && info "DenyGroups:  ${DENY_G[*]}"
+    [[ ${pw_auth,,} == yes ]]     && hit "PasswordAuthentication=yes -> the server accepts password logins"
+    [[ ${permit_root,,} == yes ]] && hit "PermitRootLogin=yes -> direct root SSH permitted (password or key)"
+    [[ $auth_methods != any ]]    && hit "AuthenticationMethods=$auth_methods -> more than one factor may be required"
+    (( match_present ))           && hit "Match blocks present -> per-user/group overrides NOT evaluated; effective policy may differ"
+
+    # Allow/Deny evaluation helpers (OpenSSH order: DenyUsers, AllowUsers, DenyGroups, AllowGroups).
+    _tok_user()   { printf '%s' "${1%%@*}"; }    # strip any @host from an Allow/Deny token
+    _match_user() { local u=$1; shift; local p; for p in "$@"; do [[ $u == $(_tok_user "$p") ]] && return 0; done; return 1; }
+    _match_group(){ local u=$1; shift; local p g ug; ug=$(id -nG "$u" 2>/dev/null); for p in "$@"; do for g in $ug; do [[ $g == $p ]] && return 0; done; done; return 1; }
+    ssh_gate() {   # 0 = may connect, 1 = blocked by Allow/Deny
+        local u=$1
+        (( ${#DENY_U[@]} ))  && _match_user  "$u" "${DENY_U[@]}"   && return 1
+        (( ${#ALLOW_U[@]} )) && ! _match_user  "$u" "${ALLOW_U[@]}" && return 1
+        (( ${#DENY_G[@]} ))  && _match_group "$u" "${DENY_G[@]}"   && return 1
+        (( ${#ALLOW_G[@]} )) && ! _match_group "$u" "${ALLOW_G[@]}" && return 1
+        return 0
+    }
+    # Password account status (needs root to read the shadow database).
+    pw_status() {  # prints: set | locked | nopw | unknown
+        local u=$1 entry h
+        (( AM_ROOT )) || { echo unknown; return; }
+        if have getent; then entry=$(getent shadow "$u" 2>/dev/null); else entry=$(grep "^${u}:" /etc/shadow 2>/dev/null); fi
+        [[ -z $entry ]] && { echo unknown; return; }
+        h=${entry#*:}; h=${h%%:*}
+        case $h in
+            '')        echo nopw ;;
+            '!'*|'*'*) echo locked ;;
+            *)         echo set ;;
+        esac
+    }
+    # Does the account have at least one authorized key we can see?
+    user_has_key() {  # prints: yes | no | unknown
+        local u=$1 home=$2 tok kf hk=no unk=0
+        for tok in $akf; do
+            tok=${tok//%%/%}; tok=${tok//%h/$home}; tok=${tok//%u/$u}
+            [[ $tok == /* ]] && kf=$tok || kf="$home/$tok"
+            if [[ -r $kf ]]; then
+                grep -qE '^[[:space:]]*[^#[:space:]]' "$kf" 2>/dev/null && hk=yes
+            elif [[ -e $kf ]]; then unk=1; fi
+        done
+        if [[ $hk == yes ]]; then echo yes; elif (( unk )); then echo unknown; else echo no; fi
+    }
+
+    sub "per-user login capability (accounts with a login shell)"
+    printf '      %-16s %-12s %-12s %s\n' USER KEY PASSWORD NOTES
+    while IFS=: read -r uname _ uid _ _ uhome ushell; do
+        [[ $uid =~ ^[0-9]+$ ]] || continue
+        is_interactive_shell "$ushell" || continue
+        notes=""
+        if [[ $uname == root ]]; then
+            case ${permit_root,,} in
+                no)                                 key_m=no;    pw_m=no;    notes="PermitRootLogin=no" ;;
+                prohibit-password|without-password) key_m=maybe; pw_m=no;    notes="PermitRootLogin=$permit_root (key only)" ;;
+                forced-commands-only)               key_m=maybe; pw_m=no;    notes="PermitRootLogin=forced-commands-only" ;;
+                *)                                  key_m=maybe; pw_m=maybe ;;
+            esac
+        else
+            key_m=maybe; pw_m=maybe
+        fi
+        [[ ${pk_auth,,} != yes ]] && key_m=no
+        [[ ${pw_auth,,} != yes ]] && pw_m=no
+        if [[ $key_m == maybe ]]; then
+            case $(user_has_key "$uname" "$uhome") in
+                yes) key_m=yes ;; no) key_m=no ;; unknown) key_m=unknown ;;
+            esac
+        fi
+        if [[ $pw_m == maybe ]]; then
+            case $(pw_status "$uname") in
+                set)     pw_m=yes ;;
+                locked)  pw_m=no ;;
+                nopw)    [[ ${empty_pw,,} == yes ]] && pw_m="yes(EMPTY!)" || pw_m=no ;;
+                unknown) pw_m=unknown ;;
+            esac
+        fi
+        if ! ssh_gate "$uname"; then key_m=no; pw_m=no; notes="BLOCKED by Allow/Deny"; fi
+        line=$(printf '%-16s %-12s %-12s %s' "$uname" "$key_m" "$pw_m" "$notes")
+        if [[ $key_m == yes || $pw_m == yes* ]]; then hit "$line"; else info "$line"; fi
+    done < <(cat /etc/passwd 2>/dev/null)
+    dim "KEY/PASSWORD: yes=able, no=blocked, maybe/unknown=cannot confirm (need root for shadow, or can't read another user's keys)."
+    dim "Non-root runs cannot read /etc/shadow or other users' keys, so many rows show 'unknown'. Match blocks are not evaluated."
+fi
+
+# ===========================================================================
 # 4. SENSITIVE FILE PERMISSIONS (passwd/shadow/sudoers + nearby backups)
 # ===========================================================================
 section "SENSITIVE FILE PERMISSIONS"
@@ -392,6 +531,7 @@ fi
 # ===========================================================================
 section "SHELL HISTORY (current user, full)"
 found=0
+shopt -s nocasematch                 # match $SENSITIVE_RE case-insensitively
 for hf in "$MY_HOME/.bash_history" "$MY_HOME/.zsh_history" "$MY_HOME/.sh_history" \
           "$MY_HOME/.ash_history" "$MY_HOME/.local/share/fish/fish_history" \
           "$MY_HOME/.python_history" "$MY_HOME/.mysql_history" "$MY_HOME/.psql_history" \
@@ -399,15 +539,27 @@ for hf in "$MY_HOME/.bash_history" "$MY_HOME/.zsh_history" "$MY_HOME/.sh_history
     [[ -r $hf ]] || continue
     found=1
     sub "$hf"
-    # Print the whole file, tagging lines that look credential-bearing.
-    grep -nE '' "$hf" 2>/dev/null | while IFS= read -r line; do
-        if grep -qiE "$SENSITIVE_RE" <<<"$line"; then
-            printf '      %s[sensitive]%s %s\n' "$C_HIT" "$C_RST" "$line"
+    # Print the whole file; tag EVERY line that looks credential-bearing, and
+    # mark later identical occurrences as duplicates (first occurrence wins).
+    # Read in the current shell (not a subshell) so the seen-map persists.
+    declare -A _seen=()
+    ln=0
+    while IFS= read -r line || [[ -n $line ]]; do
+        ((ln++))
+        if [[ $line =~ $SENSITIVE_RE ]]; then
+            if [[ -n ${_seen[$line]:-} ]]; then
+                printf '      %s[sensitive][duplicate of line %s]%s %s\n' "$C_HIT" "${_seen[$line]}" "$C_RST" "$line"
+            else
+                _seen[$line]=$ln
+                printf '      %s[sensitive]%s %s\n' "$C_HIT" "$C_RST" "$line"
+            fi
         else
             printf '      %s\n' "$line"
         fi
-    done
+    done < "$hf"
+    unset _seen
 done
+shopt -u nocasematch
 (( found )) || dim "no readable history files for ${ME}"
 
 # ===========================================================================
