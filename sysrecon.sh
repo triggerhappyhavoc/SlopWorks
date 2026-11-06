@@ -358,6 +358,74 @@ else
     dim "Non-root runs cannot read /etc/shadow or other users' keys, so many rows show 'unknown'. Match blocks are not evaluated."
 fi
 
+# --- Passive check: CVE-2026-123158 "sshole" (OpenSSH password-auth bypass) ---
+# Affects OpenSSH built against musl libc WITHOUT PAM (Alpine's default
+# openssh-server, or openssh-server-pam with UsePAM no). glibc systems
+# (Debian/Ubuntu/Fedora/RHEL) are NOT affected. Fixed upstream in 10.6p2.
+# PASSIVE: only inspects local libc/binary/config/account state - it never
+# sends a password, probes the port, or exploits anything.
+sub "CVE-2026-123158 'sshole' exposure (passive)"
+is_musl=0
+if [[ -e /etc/alpine-release ]] || ls /lib/ld-musl-* >/dev/null 2>&1 \
+   || { have ldd && ldd --version 2>&1 | grep -qi musl; } || [[ ${OS_ID:-} == alpine ]]; then
+    is_musl=1
+fi
+sshver=""; have ssh && sshver=$(ssh -V 2>&1 | head -n1)
+[[ -n $sshver ]] && info "OpenSSH banner (info only; Alpine backports within a version string): $sshver"
+if (( ! is_musl )); then
+    ok "not applicable: non-musl/glibc system (Debian/Ubuntu/RHEL/Fedora are not affected by sshole)"
+else
+    hit "musl libc detected (Alpine/musl) -> sshole preconditions are possible; checking PAM + password auth"
+    sshd_bin=$(command -v sshd 2>/dev/null); [[ -z $sshd_bin && -x /usr/sbin/sshd ]] && sshd_bin=/usr/sbin/sshd
+    pam_linked=unknown
+    if [[ -n $sshd_bin ]] && have ldd; then
+        ldd "$sshd_bin" 2>/dev/null | grep -qi 'libpam' && pam_linked=yes || pam_linked=no
+    fi
+    eff_pw=""; eff_pam=""
+    if (( AM_ROOT )) && [[ -n $sshd_bin ]]; then       # sshd -T = authoritative effective config (local, no network)
+        eff=$("$sshd_bin" -T 2>/dev/null)
+        [[ -n $eff ]] && {
+            eff_pw=$(awk 'tolower($1)=="passwordauthentication"{print tolower($2);exit}' <<<"$eff")
+            eff_pam=$(awk 'tolower($1)=="usepam"{print tolower($2);exit}' <<<"$eff")
+        }
+    fi
+    if [[ -r /etc/ssh/sshd_config ]]; then
+        [[ -z $eff_pw ]]  && eff_pw=$(awk  'BEGIN{IGNORECASE=1}/^[[:space:]]*match([[:space:]]|$)/{s=1}!s&&tolower($1)=="passwordauthentication"{print tolower($2);exit}' /etc/ssh/sshd_config)
+        [[ -z $eff_pam ]] && eff_pam=$(awk 'BEGIN{IGNORECASE=1}/^[[:space:]]*match([[:space:]]|$)/{s=1}!s&&tolower($1)=="usepam"{print tolower($2);exit}' /etc/ssh/sshd_config)
+    fi
+    eff_pw=${eff_pw:-yes}          # OpenSSH default PasswordAuthentication=yes
+    eff_pam=${eff_pam:-no}         # upstream default UsePAM=no; and no-PAM build cannot use PAM anyway
+    pam_in_use=no; [[ $pam_linked == yes && $eff_pam == yes ]] && pam_in_use=yes
+    info "sshd PAM-linked=$pam_linked  UsePAM=$eff_pam  ->  PAM in use: $pam_in_use"
+    info "PasswordAuthentication (effective): $eff_pw"
+    if [[ $pam_in_use == no && $eff_pw != no ]]; then
+        hit "POTENTIALLY VULNERABLE to CVE-2026-123158 (sshole): musl + PAM not in use + password auth enabled"
+        if (( AM_ROOT )); then
+            while IFS=: read -r acct _ auid _ _ ahome ashell; do
+                [[ $auid =~ ^[0-9]+$ ]] || continue
+                is_interactive_shell "$ashell" || continue
+                if have getent; then ent=$(getent shadow "$acct" 2>/dev/null); else ent=$(grep "^${acct}:" /etc/shadow 2>/dev/null); fi
+                [[ -z $ent ]] && continue
+                h=${ent#*:}; h=${h%%:*}
+                case $h in
+                    '')        hit "  target account: $acct ($ashell) - EMPTY password (no password set)" ;;
+                    '!'*|'*'*) hit "  target account: $acct ($ashell) - locked/disabled password (key-only style)" ;;
+                esac
+            done < <(cat /etc/passwd 2>/dev/null)
+        else
+            dim "run as root to list the password-disabled accounts an attacker could land on (reads /etc/shadow)"
+        fi
+        hit "FIX: 'apk upgrade -U openssh' (>= fixed branch pkg / OpenSSH 10.6p2) then restart sshd; or set 'PasswordAuthentication no'"
+    elif [[ $eff_pw == no ]]; then
+        ok "not exposed: PasswordAuthentication=no (password logins disabled)"
+    elif [[ $pam_in_use == yes ]]; then
+        ok "not exposed: PAM is in use (UsePAM yes and sshd linked to libpam)"
+    else
+        dim "exposure undetermined; as root run: sshd -T | grep -iE 'passwordauthentication|usepam'"
+    fi
+    dim "Official check (as root): sshd -T | grep -iE 'passwordauthentication|usepam' - not exposed if password off or PAM on."
+fi
+
 # ===========================================================================
 # 4. SENSITIVE FILE PERMISSIONS (passwd/shadow/sudoers + nearby backups)
 # ===========================================================================
