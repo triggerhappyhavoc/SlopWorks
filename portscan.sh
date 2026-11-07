@@ -74,6 +74,209 @@ warn() {
 die()  { warn "$@"; exit 2; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Typical service for a port number (STATIC SNAPSHOT, mirrors IANA / nmap-services
+# common assignments). This is only the conventional occupant of the port - a hint,
+# not a check of what is actually answering; trust the banner for that. Call as
+# `service_name <port> [tcp|udp]`; prints a short name, or nothing if unknown.
+service_name() {
+    local port=$1 proto=${2:-tcp}
+    # A handful of ports carry a different well-known service on UDP than on TCP.
+    case $proto:$port in
+        udp:67|udp:68)  echo "dhcp";        return ;;
+        udp:69)         echo "tftp";        return ;;
+        udp:123)        echo "ntp";         return ;;
+        udp:137)        echo "netbios-ns";  return ;;
+        udp:138)        echo "netbios-dgm"; return ;;
+        udp:161)        echo "snmp";        return ;;
+        udp:162)        echo "snmptrap";    return ;;
+        udp:500)        echo "isakmp/ike";  return ;;
+        udp:514)        echo "syslog";      return ;;
+        udp:520)        echo "rip";         return ;;
+        udp:1194)       echo "openvpn";     return ;;
+        udp:1900)       echo "ssdp/upnp";   return ;;
+        udp:4500)       echo "ipsec-nat-t"; return ;;
+        udp:5060)       echo "sip";         return ;;
+        udp:5353)       echo "mdns";        return ;;
+    esac
+    case $port in
+        7)       echo "echo" ;;
+        19)      echo "chargen" ;;
+        20)      echo "ftp-data" ;;
+        21)      echo "ftp" ;;
+        22)      echo "ssh" ;;
+        23)      echo "telnet" ;;
+        25)      echo "smtp" ;;
+        37)      echo "time" ;;
+        43)      echo "whois" ;;
+        49)      echo "tacacs" ;;
+        53)      echo "domain/dns" ;;
+        67|68)   echo "dhcp" ;;
+        69)      echo "tftp" ;;
+        70)      echo "gopher" ;;
+        79)      echo "finger" ;;
+        80)      echo "http" ;;
+        88)      echo "kerberos" ;;
+        102)     echo "iso-tsap/s7" ;;
+        110)     echo "pop3" ;;
+        111)     echo "rpcbind/nfs" ;;
+        113)     echo "ident" ;;
+        119)     echo "nntp" ;;
+        123)     echo "ntp" ;;
+        135)     echo "msrpc" ;;
+        137)     echo "netbios-ns" ;;
+        138)     echo "netbios-dgm" ;;
+        139)     echo "netbios-ssn" ;;
+        143)     echo "imap" ;;
+        161)     echo "snmp" ;;
+        162)     echo "snmptrap" ;;
+        179)     echo "bgp" ;;
+        194)     echo "irc" ;;
+        389)     echo "ldap" ;;
+        427)     echo "svrloc/slp" ;;
+        443)     echo "https" ;;
+        445)     echo "microsoft-ds/smb" ;;
+        464)     echo "kpasswd" ;;
+        465)     echo "smtps" ;;
+        500)     echo "isakmp/ike" ;;
+        502)     echo "modbus" ;;
+        512)     echo "exec" ;;
+        513)     echo "login/rlogin" ;;
+        514)     echo "shell/syslog" ;;
+        515)     echo "printer/lpd" ;;
+        520)     echo "rip" ;;
+        523)     echo "db2" ;;
+        540)     echo "uucp" ;;
+        543)     echo "klogin" ;;
+        544)     echo "kshell" ;;
+        546|547) echo "dhcpv6" ;;
+        548)     echo "afp" ;;
+        554)     echo "rtsp" ;;
+        587)     echo "submission/smtp" ;;
+        593)     echo "http-rpc-epmap" ;;
+        623)     echo "ipmi/asf-rmcp" ;;
+        631)     echo "ipp/cups" ;;
+        636)     echo "ldaps" ;;
+        873)     echo "rsync" ;;
+        902)     echo "vmware-auth" ;;
+        989)     echo "ftps-data" ;;
+        990)     echo "ftps" ;;
+        993)     echo "imaps" ;;
+        995)     echo "pop3s" ;;
+        1080)    echo "socks" ;;
+        1099)    echo "java-rmi" ;;
+        1194)    echo "openvpn" ;;
+        1352)    echo "lotus-notes" ;;
+        1433)    echo "ms-sql-s" ;;
+        1434)    echo "ms-sql-m" ;;
+        1521)    echo "oracle-tns" ;;
+        1723)    echo "pptp" ;;
+        1812)    echo "radius" ;;
+        1813)    echo "radius-acct" ;;
+        1883)    echo "mqtt" ;;
+        1900)    echo "ssdp/upnp" ;;
+        2049)    echo "nfs" ;;
+        2082|2083) echo "cpanel" ;;
+        2086|2087) echo "whm" ;;
+        2121)    echo "ftp-alt" ;;
+        2181)    echo "zookeeper" ;;
+        2222)    echo "ssh-alt" ;;
+        2375)    echo "docker" ;;
+        2376)    echo "docker-tls" ;;
+        2379|2380) echo "etcd" ;;
+        2483)    echo "oracle" ;;
+        2484)    echo "oracle-ssl" ;;
+        3000)    echo "http-dev/grafana" ;;
+        3128)    echo "squid-proxy" ;;
+        3260)    echo "iscsi" ;;
+        3268)    echo "globalcat-ldap" ;;
+        3269)    echo "globalcat-ldaps" ;;
+        3306)    echo "mysql" ;;
+        3389)    echo "rdp/ms-wbt" ;;
+        3632)    echo "distcc" ;;
+        3690)    echo "svn" ;;
+        4369)    echo "epmd/erlang" ;;
+        4444)    echo "metasploit/krb524" ;;
+        4500)    echo "ipsec-nat-t" ;;
+        4505|4506) echo "saltstack" ;;
+        4786)    echo "cisco-smi" ;;
+        4848)    echo "glassfish-admin" ;;
+        5000)    echo "upnp/http-dev" ;;
+        5038)    echo "asterisk-ami" ;;
+        5060)    echo "sip" ;;
+        5061)    echo "sips" ;;
+        5222)    echo "xmpp-client" ;;
+        5269)    echo "xmpp-server" ;;
+        5353)    echo "mdns" ;;
+        5357)    echo "wsdapi" ;;
+        5432)    echo "postgresql" ;;
+        5555)    echo "adb/freeciv" ;;
+        5601)    echo "kibana" ;;
+        5666)    echo "nrpe/nagios" ;;
+        5672)    echo "amqp/rabbitmq" ;;
+        5683)    echo "coap" ;;
+        5800)    echo "vnc-http" ;;
+        5900)    echo "vnc" ;;
+        5938)    echo "teamviewer" ;;
+        5984)    echo "couchdb" ;;
+        5985)    echo "winrm-http" ;;
+        5986)    echo "winrm-https" ;;
+        6000)    echo "x11" ;;
+        6379)    echo "redis" ;;
+        6443)    echo "kubernetes-api" ;;
+        6514)    echo "syslog-tls" ;;
+        6666|6667|6697) echo "irc" ;;
+        7001)    echo "weblogic" ;;
+        7077)    echo "spark" ;;
+        7199)    echo "cassandra-jmx" ;;
+        7474)    echo "neo4j" ;;
+        7547)    echo "cwmp/tr-069" ;;
+        8000)    echo "http-alt" ;;
+        8009)    echo "ajp13/tomcat" ;;
+        8080)    echo "http-proxy/alt" ;;
+        8081)    echo "http-alt" ;;
+        8086)    echo "influxdb" ;;
+        8089)    echo "splunkd" ;;
+        8140)    echo "puppet" ;;
+        8161)    echo "activemq-web" ;;
+        8200)    echo "vault" ;;
+        8291)    echo "mikrotik-winbox" ;;
+        8443)    echo "https-alt" ;;
+        8500)    echo "consul" ;;
+        8530)    echo "wsus" ;;
+        8531)    echo "wsus-ssl" ;;
+        8545)    echo "ethereum-rpc" ;;
+        8686)    echo "jmx" ;;
+        8761)    echo "eureka" ;;
+        8888)    echo "http-alt/jupyter" ;;
+        9000)    echo "php-fpm/portainer" ;;
+        9001)    echo "tor/supervisor" ;;
+        9042)    echo "cassandra-cql" ;;
+        9090)    echo "prometheus" ;;
+        9092)    echo "kafka" ;;
+        9100)    echo "jetdirect/node-exp" ;;
+        9200)    echo "elasticsearch" ;;
+        9300)    echo "elasticsearch-node" ;;
+        9418)    echo "git" ;;
+        9443)    echo "https-alt" ;;
+        9999)    echo "http-alt" ;;
+        10000)   echo "webmin/ndmp" ;;
+        10250)   echo "kubelet" ;;
+        11211)   echo "memcached" ;;
+        15672)   echo "rabbitmq-mgmt" ;;
+        16379)   echo "redis-cluster" ;;
+        19999)   echo "netdata" ;;
+        20000)   echo "dnp3" ;;
+        25565)   echo "minecraft" ;;
+        27017)   echo "mongodb" ;;
+        27018)   echo "mongodb-shard" ;;
+        27019)   echo "mongodb-config" ;;
+        28017)   echo "mongodb-web" ;;
+        50000)   echo "sap/db2" ;;
+        61616)   echo "activemq" ;;
+        *)       echo "" ;;
+    esac
+}
+
 # Print each number in a spec such as "1,3,7-9", rejecting anything outside
 # min..max. Shared by port lists and IP octets.
 expand_list() {
@@ -322,16 +525,17 @@ list_probes() {
 }
 
 print_report() {
-    local index port banner current=-1
+    local index port banner current=-1 svc
 
     while IFS=$'\t' read -r index port banner; do
         if ((index != current)); then
             ((current >= 0)) && echo
             current=$index
             printf 'Scan report for %s\n' "${host_labels[index]}"
-            printf '%-12s%-7s%s\n' PORT STATE BANNER
+            printf '%-12s%-7s%-20s%s\n' PORT STATE SERVICE BANNER
         fi
-        printf '%-12s%-7s%s\n' "$port/tcp" open "$banner"
+        svc=$(service_name "$port" tcp); [[ -n $svc ]] || svc=unknown
+        printf '%-12s%-7s%-20s%s\n' "$port/tcp" open "$svc" "$banner"
         ((open_count += 1))
     done
     ((open_count > 0)) || echo 'No open ports found.'

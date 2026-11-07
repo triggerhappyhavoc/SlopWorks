@@ -92,6 +92,209 @@ SENSITIVE_RE='pass(wd|word)?=|secret|token|api[_-]?key|private[_-]?key|credentia
 # match is flagged as "abusable per GTFOBins" - verify the exact technique.
 GTFO='aa-exec|ab|agetty|alpine|ansible-playbook|aoss|apt|apt-get|ar|aria2c|arj|arp|as|ascii-xfr|ash|aspell|atobm|awk|aws|base32|base64|basenc|bash|batcat|bconsole|bpftrace|bridge|bundle|bundler|busctl|busybox|byebug|bzip2|c89|c99|cabal|capsh|cat|cdist|certbot|check_by_ssh|check_cmd|check_log|check_memory|check_raid|check_ssl_cert|check_statusfile|chmod|choom|chown|chroot|clamscan|cmp|cobc|column|comm|composer|cowsay|cowthink|cp|cpan|cpio|cpulimit|crash|crontab|csh|csplit|csvtool|cupsfilter|curl|cut|dash|date|dc|dd|debugfs|dialog|diff|dig|distcc|dmesg|dmidecode|dmsetup|dnf|docker|dosbox|dotnet|dpkg|dstat|dvips|easy_install|ed|efax|elvish|emacs|env|eqn|espeak|ex|exiftool|expand|expect|facter|file|find|finger|fish|flock|fmt|fold|fping|ftp|gawk|gcc|gcore|gdb|gem|genie|genisoimage|ghc|ghci|gimp|ginsh|git|grc|grep|gtester|gzip|hd|head|hexdump|highlight|hping3|iconv|iftop|install|ionice|ip|irb|ispell|jjs|joe|join|journalctl|jq|jrunscript|jtag|julia|knife|ksh|ksshell|kubectl|latex|latexmk|ld.so|ldconfig|less|lftp|links|ln|loginctl|logsave|look|lp|ltrace|lua|lualatex|luatex|lwp-download|lwp-request|mail|make|man|mawk|minicom|more|mosquitto|mount|msfconsole|msgattrib|msgcat|msgconv|msgfilter|msgmerge|msguniq|mtr|multitime|mv|mysql|nano|nasm|nawk|nc|ncdu|ncftp|neofetch|nft|nice|nl|nmap|node|nohup|npm|nroff|nsenter|octave|od|openssl|openvpn|openvt|opkg|pandoc|paste|pdb|pdflatex|pdftex|perf|perl|pexec|pg|php|pic|pico|pidstat|pip|pkexec|pkg|posh|pr|pry|psql|ptx|puppet|python|python2|python3|rake|rc|readelf|red|redcarpet|redis|restic|rev|rlogin|rlwrap|rpm|rpmdb|rpmquery|rpmverify|rsync|rtorrent|ruby|run-mailcap|run-parts|runscript|rview|rvim|sash|scanmem|scp|screen|script|scrot|sed|service|setarch|setfacl|setlock|sftp|sg|shuf|slsh|smbclient|snap|socat|soelim|softlimit|sort|split|sqlite3|sqlmap|ss|ssh|ssh-agent|ssh-keygen|ssh-keyscan|sshpass|start-stop-daemon|stdbuf|strace|strings|su|sudo|sysctl|systemctl|systemd-resolve|tac|tail|tar|task|taskset|tbl|tclsh|tcpdump|tdbtool|tee|telnet|terraform|tex|tftp|tic|time|timedatectl|timeout|tmate|tmux|top|torify|torsocks|troff|tshark|ul|unexpand|uniq|unshare|unsquashfs|unzip|update-alternatives|uudecode|uuencode|vagrant|valgrind|vi|view|vigr|vim|vimdiff|vipw|virsh|volatility|w3m|wall|watch|wc|wget|whiptail|whois|wireshark|wish|xargs|xdg-user-dir|xdotool|xelatex|xetex|xmodmap|xmore|xpad|xxd|xz|yarn|yash|yelp|yum|zathura|zip|zsh|zsoelim|zypper'
 
+# Typical service for a port number (STATIC SNAPSHOT, mirrors IANA / nmap-services
+# common assignments). This is only the conventional occupant of the port - a hint
+# for reading the listening-port map, not a check of what is actually bound there.
+# Call as `service_name <port> [tcp|udp]`; prints a short name, or nothing if unknown.
+service_name() {
+    local port=$1 proto=${2:-tcp}
+    # A handful of ports carry a different well-known service on UDP than on TCP.
+    case $proto:$port in
+        udp:67|udp:68)  echo "dhcp";        return ;;
+        udp:69)         echo "tftp";        return ;;
+        udp:123)        echo "ntp";         return ;;
+        udp:137)        echo "netbios-ns";  return ;;
+        udp:138)        echo "netbios-dgm"; return ;;
+        udp:161)        echo "snmp";        return ;;
+        udp:162)        echo "snmptrap";    return ;;
+        udp:500)        echo "isakmp/ike";  return ;;
+        udp:514)        echo "syslog";      return ;;
+        udp:520)        echo "rip";         return ;;
+        udp:1194)       echo "openvpn";     return ;;
+        udp:1900)       echo "ssdp/upnp";   return ;;
+        udp:4500)       echo "ipsec-nat-t"; return ;;
+        udp:5060)       echo "sip";         return ;;
+        udp:5353)       echo "mdns";        return ;;
+    esac
+    case $port in
+        7)       echo "echo" ;;
+        19)      echo "chargen" ;;
+        20)      echo "ftp-data" ;;
+        21)      echo "ftp" ;;
+        22)      echo "ssh" ;;
+        23)      echo "telnet" ;;
+        25)      echo "smtp" ;;
+        37)      echo "time" ;;
+        43)      echo "whois" ;;
+        49)      echo "tacacs" ;;
+        53)      echo "domain/dns" ;;
+        67|68)   echo "dhcp" ;;
+        69)      echo "tftp" ;;
+        70)      echo "gopher" ;;
+        79)      echo "finger" ;;
+        80)      echo "http" ;;
+        88)      echo "kerberos" ;;
+        102)     echo "iso-tsap/s7" ;;
+        110)     echo "pop3" ;;
+        111)     echo "rpcbind/nfs" ;;
+        113)     echo "ident" ;;
+        119)     echo "nntp" ;;
+        123)     echo "ntp" ;;
+        135)     echo "msrpc" ;;
+        137)     echo "netbios-ns" ;;
+        138)     echo "netbios-dgm" ;;
+        139)     echo "netbios-ssn" ;;
+        143)     echo "imap" ;;
+        161)     echo "snmp" ;;
+        162)     echo "snmptrap" ;;
+        179)     echo "bgp" ;;
+        194)     echo "irc" ;;
+        389)     echo "ldap" ;;
+        427)     echo "svrloc/slp" ;;
+        443)     echo "https" ;;
+        445)     echo "microsoft-ds/smb" ;;
+        464)     echo "kpasswd" ;;
+        465)     echo "smtps" ;;
+        500)     echo "isakmp/ike" ;;
+        502)     echo "modbus" ;;
+        512)     echo "exec" ;;
+        513)     echo "login/rlogin" ;;
+        514)     echo "shell/syslog" ;;
+        515)     echo "printer/lpd" ;;
+        520)     echo "rip" ;;
+        523)     echo "db2" ;;
+        540)     echo "uucp" ;;
+        543)     echo "klogin" ;;
+        544)     echo "kshell" ;;
+        546|547) echo "dhcpv6" ;;
+        548)     echo "afp" ;;
+        554)     echo "rtsp" ;;
+        587)     echo "submission/smtp" ;;
+        593)     echo "http-rpc-epmap" ;;
+        623)     echo "ipmi/asf-rmcp" ;;
+        631)     echo "ipp/cups" ;;
+        636)     echo "ldaps" ;;
+        873)     echo "rsync" ;;
+        902)     echo "vmware-auth" ;;
+        989)     echo "ftps-data" ;;
+        990)     echo "ftps" ;;
+        993)     echo "imaps" ;;
+        995)     echo "pop3s" ;;
+        1080)    echo "socks" ;;
+        1099)    echo "java-rmi" ;;
+        1194)    echo "openvpn" ;;
+        1352)    echo "lotus-notes" ;;
+        1433)    echo "ms-sql-s" ;;
+        1434)    echo "ms-sql-m" ;;
+        1521)    echo "oracle-tns" ;;
+        1723)    echo "pptp" ;;
+        1812)    echo "radius" ;;
+        1813)    echo "radius-acct" ;;
+        1883)    echo "mqtt" ;;
+        1900)    echo "ssdp/upnp" ;;
+        2049)    echo "nfs" ;;
+        2082|2083) echo "cpanel" ;;
+        2086|2087) echo "whm" ;;
+        2121)    echo "ftp-alt" ;;
+        2181)    echo "zookeeper" ;;
+        2222)    echo "ssh-alt" ;;
+        2375)    echo "docker" ;;
+        2376)    echo "docker-tls" ;;
+        2379|2380) echo "etcd" ;;
+        2483)    echo "oracle" ;;
+        2484)    echo "oracle-ssl" ;;
+        3000)    echo "http-dev/grafana" ;;
+        3128)    echo "squid-proxy" ;;
+        3260)    echo "iscsi" ;;
+        3268)    echo "globalcat-ldap" ;;
+        3269)    echo "globalcat-ldaps" ;;
+        3306)    echo "mysql" ;;
+        3389)    echo "rdp/ms-wbt" ;;
+        3632)    echo "distcc" ;;
+        3690)    echo "svn" ;;
+        4369)    echo "epmd/erlang" ;;
+        4444)    echo "metasploit/krb524" ;;
+        4500)    echo "ipsec-nat-t" ;;
+        4505|4506) echo "saltstack" ;;
+        4786)    echo "cisco-smi" ;;
+        4848)    echo "glassfish-admin" ;;
+        5000)    echo "upnp/http-dev" ;;
+        5038)    echo "asterisk-ami" ;;
+        5060)    echo "sip" ;;
+        5061)    echo "sips" ;;
+        5222)    echo "xmpp-client" ;;
+        5269)    echo "xmpp-server" ;;
+        5353)    echo "mdns" ;;
+        5357)    echo "wsdapi" ;;
+        5432)    echo "postgresql" ;;
+        5555)    echo "adb/freeciv" ;;
+        5601)    echo "kibana" ;;
+        5666)    echo "nrpe/nagios" ;;
+        5672)    echo "amqp/rabbitmq" ;;
+        5683)    echo "coap" ;;
+        5800)    echo "vnc-http" ;;
+        5900)    echo "vnc" ;;
+        5938)    echo "teamviewer" ;;
+        5984)    echo "couchdb" ;;
+        5985)    echo "winrm-http" ;;
+        5986)    echo "winrm-https" ;;
+        6000)    echo "x11" ;;
+        6379)    echo "redis" ;;
+        6443)    echo "kubernetes-api" ;;
+        6514)    echo "syslog-tls" ;;
+        6666|6667|6697) echo "irc" ;;
+        7001)    echo "weblogic" ;;
+        7077)    echo "spark" ;;
+        7199)    echo "cassandra-jmx" ;;
+        7474)    echo "neo4j" ;;
+        7547)    echo "cwmp/tr-069" ;;
+        8000)    echo "http-alt" ;;
+        8009)    echo "ajp13/tomcat" ;;
+        8080)    echo "http-proxy/alt" ;;
+        8081)    echo "http-alt" ;;
+        8086)    echo "influxdb" ;;
+        8089)    echo "splunkd" ;;
+        8140)    echo "puppet" ;;
+        8161)    echo "activemq-web" ;;
+        8200)    echo "vault" ;;
+        8291)    echo "mikrotik-winbox" ;;
+        8443)    echo "https-alt" ;;
+        8500)    echo "consul" ;;
+        8530)    echo "wsus" ;;
+        8531)    echo "wsus-ssl" ;;
+        8545)    echo "ethereum-rpc" ;;
+        8686)    echo "jmx" ;;
+        8761)    echo "eureka" ;;
+        8888)    echo "http-alt/jupyter" ;;
+        9000)    echo "php-fpm/portainer" ;;
+        9001)    echo "tor/supervisor" ;;
+        9042)    echo "cassandra-cql" ;;
+        9090)    echo "prometheus" ;;
+        9092)    echo "kafka" ;;
+        9100)    echo "jetdirect/node-exp" ;;
+        9200)    echo "elasticsearch" ;;
+        9300)    echo "elasticsearch-node" ;;
+        9418)    echo "git" ;;
+        9443)    echo "https-alt" ;;
+        9999)    echo "http-alt" ;;
+        10000)   echo "webmin/ndmp" ;;
+        10250)   echo "kubelet" ;;
+        11211)   echo "memcached" ;;
+        15672)   echo "rabbitmq-mgmt" ;;
+        16379)   echo "redis-cluster" ;;
+        19999)   echo "netdata" ;;
+        20000)   echo "dnp3" ;;
+        25565)   echo "minecraft" ;;
+        27017)   echo "mongodb" ;;
+        27018)   echo "mongodb-shard" ;;
+        27019)   echo "mongodb-config" ;;
+        28017)   echo "mongodb-web" ;;
+        50000)   echo "sap/db2" ;;
+        61616)   echo "activemq" ;;
+        *)       echo "" ;;
+    esac
+}
+
 # ===========================================================================
 # 1. USEFUL TOOLS PRESENT
 # ===========================================================================
@@ -203,21 +406,26 @@ can_elevate() {                               # $1 = username
 if [[ -r /etc/passwd ]]; then
     while IFS=: read -r name _ uid gid _ home shell; do
         [[ $uid =~ ^[0-9]+$ ]] || continue
-        tags=""; flag=0
-        if (( uid == 0 )); then tags+=" UID0"; (( uid==0 )) && [[ $name != root ]] && flag=1
+        tags=""; flag=0; rogue_uid0=0
+        if (( uid == 0 )); then
+            tags+=" UID0"
+            # Any UID 0 account other than 'root' is root-equivalent regardless
+            # of its login shell (su target / tampering evidence) - always flag it.
+            [[ $name != root ]] && { flag=1; rogue_uid0=1; }
         elif (( uid >= UID_MIN && uid <= UID_MAX )); then tags+=" regular"; flag=1
         else tags+=" system"; fi
         if is_interactive_shell "$shell"; then tags+=" interactive-shell"; else flag=0; fi
         if can_elevate "$name"; then tags+=" PRIV-CAPABLE"; flag=1; fi
         line="$name  uid=$uid gid=$gid  shell=$shell  home=$home  [${tags# }]"
-        if (( flag )) && is_interactive_shell "$shell"; then hit "$line"
+        if (( rogue_uid0 )); then hit "$line"
+        elif (( flag )) && is_interactive_shell "$shell"; then hit "$line"
         elif [[ $tags == *PRIV-CAPABLE* ]]; then hit "$line"
         else info "$line"; fi
     done < /etc/passwd
 else
     hit "/etc/passwd not readable (unusual)"
 fi
-dim "highlighted = non-standard/human account with a login shell, or able to elevate (sudoers/privileged group)"
+dim "highlighted = a second UID 0 account, a non-standard/human account with a login shell, or an account able to elevate (sudoers/privileged group)"
 
 # ===========================================================================
 # 3b. SSH LOGIN ACCESS (which local accounts can log in to THIS host, and how)
@@ -667,13 +875,33 @@ section "RUNNING APPS & LISTENING PORTS"
 if have ss; then
     sub "listening sockets with owning process (ss -tulnp)"
     ss -tulnp 2>/dev/null | indent
-    sub "port -> process map"
+    sub "port -> service/process map"
+    printf '      %-5s %-22s %-20s %s\n' PROTO LOCAL SERVICE PROCESS
     ss -tulnp 2>/dev/null | awk 'NR>1 {
-        proto=$1; local=$5; proc=$NF;
-        n=split(local,a,":"); port=a[n];
-        gsub(/users:\(\(|\)\).*$|"/,"",proc);
-        printf "      %-4s %-20s %s\n", proto, local, proc
-    }'
+        proto=$1; local=$5; line=$0;
+        # Parse each ("name",pid=NNN,fd=..) entry out of the users:((...)) blob,
+        # grouping pids under their process name so multi-worker daemons
+        # (httpd, nginx) show as name(pid1,pid2,...) once instead of repeating.
+        # Scanning $0 (not $NF) also survives process names that contain spaces.
+        # split("",arr) clears per-record and stays POSIX-portable (mawk/busybox).
+        split("", pids); split("", order); n=0;
+        while (match(line, /"[^"]+",(pid=)?[0-9]+/)) {
+            tok=substr(line, RSTART, RLENGTH); line=substr(line, RSTART+RLENGTH);
+            name=substr(tok, 2); name=substr(name, 1, index(name, "\"")-1);
+            pid=tok; sub(/^"[^"]+",/, "", pid); sub(/^pid=/, "", pid);
+            if (name in pids) pids[name]=pids[name] "," pid;
+            else { order[++n]=name; pids[name]=pid; }
+        }
+        out="";
+        for (i=1; i<=n; i++) out=(out=="" ? "" : out ",") order[i] "(" pids[order[i]] ")";
+        if (out=="") out="-";   # no privilege to see owner, or kernel socket
+        print proto "\t" local "\t" out
+    }' | while IFS=$'\t' read -r proto local proc; do
+        port=${local##*:}
+        svc=$(service_name "$port" "$proto"); [[ -n $svc ]] || svc="-"
+        printf '      %-5s %-22s %-20s %s\n' "$proto" "$local" "$svc" "$proc"
+    done
+    dim "SERVICE = typical assignment for that port (static snapshot), not a check of what is actually bound."
 elif have netstat; then
     sub "listening sockets (netstat -tulnp)"
     netstat -tulnp 2>/dev/null | indent
@@ -733,6 +961,9 @@ info "release: $krel"
 info "version: $(uname -v 2>/dev/null)"
 info "arch:    $(uname -m 2>/dev/null)"
 IFS=. read -r kmaj kmin kpatch _ <<<"$kver"
+# Keep only the leading digits of each component so rc/custom version strings
+# (e.g. 5.15.0rc1) don't abort the base-10 arithmetic below with an empty knum.
+kmaj=${kmaj%%[!0-9]*}; kmin=${kmin%%[!0-9]*}; kpatch=${kpatch%%[!0-9]*}
 kmaj=${kmaj:-0}; kmin=${kmin:-0}; kpatch=${kpatch:-0}
 knum=$(( 10#$kmaj*1000000 + 10#$kmin*1000 + 10#$kpatch ))
 ver_lt() { (( knum < $1*1000000 + $2*1000 + $3 )); }
@@ -803,7 +1034,7 @@ if have systemctl; then
         env=$(systemctl show "$svc" -p Environment --value 2>/dev/null)
         if [[ -n $env ]] && grep -qiE "$SENSITIVE_RE" <<<"$env"; then
             hit "$svc Environment= contains a sensitive-looking value:"
-            grep -oiE "$SENSITIVE_RE[^ ]*" <<<"$env" | sed 's/^/        /'
+            grep -oiE "(${SENSITIVE_RE})[^ ]*" <<<"$env" | sed 's/^/        /'
         fi
         # EnvironmentFile= contents, if we can read them.
         for ef in $(systemctl show "$svc" -p EnvironmentFiles --value 2>/dev/null | grep -oE '/[^ ]+'); do
