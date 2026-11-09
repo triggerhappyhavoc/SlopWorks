@@ -2,11 +2,13 @@
 #
 # sysrecon.sh - Local host enumeration for AUTHORIZED security assessments.
 #
-# Read-only reconnaissance of the host it runs on, in the LinPEAS / LinEnum
-# family. It only READS system state (files, package DBs, process/socket/
-# service/cron listings) and reports what it finds; it never writes to,
-# modifies, downloads, or exploits anything. Use only on systems you are
-# authorized to assess (pentest engagements, CTFs, your own machines).
+# Reconnaissance of the host it runs on, in the LinPEAS / LinEnum family. It
+# READS system state (files, package DBs, process/socket/service/cron listings)
+# and reports what it finds. The ONLY thing it writes is a single CSV inventory
+# of installed packages, created in the current working directory (disable with
+# --no-csv); it never modifies system state, downloads, or exploits anything.
+# Use only on systems you are authorized to assess (pentest engagements, CTFs,
+# your own machines).
 #
 # Supports Debian/Ubuntu and RedHat-family (RHEL/CentOS/Fedora/Rocky/Alma).
 # The GTFOBins match list and the kernel-CVE list are STATIC SNAPSHOTS baked
@@ -16,6 +18,7 @@
 #   ./sysrecon.sh            # full run (includes slow full-'/' find scans)
 #   ./sysrecon.sh --fast     # skip the slow full-'/' find scans (SUID/SGID/sticky)
 #   ./sysrecon.sh --full     # remove the output caps on find/daemon scans
+#   ./sysrecon.sh --no-csv   # do not write the installed-packages CSV (read-only)
 #   ./sysrecon.sh | tee out  # keep a copy; colour auto-disables when piped
 #   NO_COLOR=1 ./sysrecon.sh # force plain output
 #
@@ -46,17 +49,27 @@ dim()     { printf '%s      %s%s\n' "$C_DIM" "$*" "$C_RST"; }
 have()    { command -v "$1" >/dev/null 2>&1; }
 missing() { dim "($1 not installed / not in PATH, skipping)"; }
 indent()  { sed 's/^/      /'; }
+# RFC-4180 CSV field: quote if it contains a comma, quote or newline; double any
+# embedded quote. Used by the installed-package CSV export (section 14).
+csv_escape() {
+    local s=${1-}
+    case $s in
+        *[,\"$'\n'$'\r']*) printf '"%s"' "${s//\"/\"\"}" ;;
+        *)                 printf '%s' "$s" ;;
+    esac
+}
 
 # ---------------------------------------------------------------------------
 # Options / scan mode
 # ---------------------------------------------------------------------------
-FAST=0; FULL=0
+FAST=0; FULL=0; WRITE_CSV=1
 FIND_CAP=200          # max lines kept from each capped scan in normal mode
 for arg in "$@"; do
     case $arg in
         --fast) FAST=1 ;;
         --full) FULL=1 ;;
-        -h|--help) sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --no-csv) WRITE_CSV=0 ;;
+        -h|--help) sed -n '3,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) printf 'sysrecon.sh: unknown option %q (try --help)\n' "$arg" >&2; exit 2 ;;
     esac
 done
@@ -868,6 +881,40 @@ have snap    && { sub "snap";    snap list        2>/dev/null | cap | indent; }
 have flatpak && { sub "flatpak"; flatpak list     2>/dev/null | cap | indent; }
 have pip3    && { sub "pip3";    pip3 list         2>/dev/null | cap | indent; }
 
+# --- Installed-package inventory to CSV (the only file this script writes) ---
+# Emits one row per package across every package source present, with proper
+# RFC-4180 quoting, into ./sysrecon-packages-<host>-<timestamp>.csv. Opt out
+# with --no-csv to keep the run strictly read-only.
+if (( WRITE_CSV )); then
+    sub "CSV export (installed applications + versions)"
+    csv_host=$(hostname 2>/dev/null); csv_host=${csv_host:-host}; csv_host=${csv_host//[^A-Za-z0-9_.-]/_}
+    csv_ts=$(date +%Y%m%d-%H%M%S 2>/dev/null); csv_ts=${csv_ts:-output}
+    csv_path="./sysrecon-packages-${csv_host}-${csv_ts}.csv"
+    if : > "$csv_path" 2>/dev/null; then
+        {
+            printf 'source,name,version\n'
+            if is_debian && have dpkg-query; then
+                dpkg-query -W -f='${Package}\t${Version}\n' 2>/dev/null \
+                  | while IFS=$'\t' read -r n v; do printf '%s,%s,%s\n' dpkg "$(csv_escape "$n")" "$(csv_escape "$v")"; done
+            elif is_redhat && have rpm; then
+                rpm -qa --qf '%{NAME}\t%{VERSION}-%{RELEASE}\n' 2>/dev/null \
+                  | while IFS=$'\t' read -r n v; do printf '%s,%s,%s\n' rpm "$(csv_escape "$n")" "$(csv_escape "$v")"; done
+            fi
+            have snap    && snap list 2>/dev/null | awk 'NR>1 && NF>=2 {print $1"\t"$2}' \
+                  | while IFS=$'\t' read -r n v; do printf '%s,%s,%s\n' snap "$(csv_escape "$n")" "$(csv_escape "$v")"; done
+            have flatpak && flatpak list --columns=application,version 2>/dev/null \
+                  | while IFS=$'\t' read -r n v; do [[ -n $n ]] && printf '%s,%s,%s\n' flatpak "$(csv_escape "$n")" "$(csv_escape "$v")"; done
+            have pip3    && pip3 list --format=freeze 2>/dev/null \
+                  | while IFS= read -r line; do n=${line%%==*}; v=${line#*==}; [[ -n $n && $n != "$line" ]] && printf '%s,%s,%s\n' pip3 "$(csv_escape "$n")" "$(csv_escape "$v")"; done
+        } >> "$csv_path" 2>/dev/null
+        rows=$(( $(wc -l < "$csv_path" 2>/dev/null) - 1 )); (( rows < 0 )) && rows=0
+        ok "installed-package inventory written: $csv_path  ($rows rows)"
+        dim "columns: source,name,version (RFC-4180 quoted). This is the only file sysrecon writes; suppress with --no-csv."
+    else
+        hit "cannot write CSV to the current directory ($(pwd 2>/dev/null)) - skipping (cd to a writable dir, or pass --no-csv)"
+    fi
+fi
+
 # ===========================================================================
 # 15. RUNNING APPLICATIONS + PORT CORRELATION
 # ===========================================================================
@@ -1014,7 +1061,159 @@ dim "Distros backport fixes without bumping the version string - confirm against
 dim "For a maintained database use standalone linux-exploit-suggester / -2."
 
 # ===========================================================================
-# 20. SYSTEM DAEMONS - sensitive information
+# 20. SYSTEMD SERVICES - STATE / BOOT / RUN-AS / EXEC PATH
+#     For every discovered service unit: its current state, whether it starts
+#     on boot, the user it actually runs under (correlated to the live MainPID
+#     via ps, else the configured identity), whether it sets an explicit
+#     User=/Group= and DynamicUser, and the ExecStart command grepped straight
+#     from the unit file. Non-absolute (relative/specifier) ExecStart paths and
+#     user-writable ExecStart binaries are highlighted as hijack/tamper vectors.
+# ===========================================================================
+section "SYSTEMD SERVICES - STATE / BOOT / RUN-AS / EXEC"
+if have systemctl; then
+    # Union of units that have a unit file (incl. enabled-but-stopped) and units
+    # currently loaded, so nothing bootable or transient is missed.
+    mapfile -t SVC_UNITS < <(
+        { systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk '{print $1}'
+          systemctl list-units      --type=service --all --no-legend --no-pager 2>/dev/null | awk '{print $1}'
+        } | grep -E '\.service$' | sort -u
+    )
+    if (( ${#SVC_UNITS[@]} == 0 )); then
+        dim "no service units enumerated"
+    else
+        sub "per-service inventory (state / boot / run-as / identity / ExecStart)"
+        printf '      %-30s %-16s %-9s %-14s %-6s %s\n' UNIT STATE BOOT RUN-AS ID EXEC
+        RELATIVE_EXEC=(); ROOT_NOISO=(); WRITABLE_EXEC=()
+        svc_count=0
+        for svc in "${SVC_UNITS[@]}"; do
+            [[ -n $svc ]] || continue
+            (( FULL )) || { (( svc_count >= FIND_CAP )) && { dim "... (capped at $FIND_CAP services; --full for all)"; break; }; }
+            ((svc_count++))
+
+            # One show call per unit, parsed Key=Value into an assoc array.
+            declare -A S=()
+            while IFS= read -r kv; do
+                [[ $kv == *=* ]] || continue
+                S[${kv%%=*}]=${kv#*=}
+            done < <(systemctl show "$svc" --no-pager \
+                        -p Id -p LoadState -p ActiveState -p SubState -p UnitFileState \
+                        -p User -p Group -p DynamicUser -p MainPID -p FragmentPath \
+                        -p DropInPaths -p ExecStart 2>/dev/null)
+
+            state="${S[ActiveState]:-?}/${S[SubState]:-?}"
+            boot=${S[UnitFileState]:-?}
+            cfg_user=${S[User]:-}; cfg_group=${S[Group]:-}
+            dynuser=${S[DynamicUser]:-no}; dynuser=${dynuser,,}
+            mainpid=${S[MainPID]:-0}; [[ $mainpid =~ ^[0-9]+$ ]] || mainpid=0
+
+            # Identity posture (the explicit-User/Group + DynamicUser check),
+            # compacted into one cell: U+G = both set, U / G = one set,
+            # dyn = DynamicUser=yes, root = none set and DynamicUser=no.
+            if [[ $dynuser == yes ]]; then
+                idset="dyn"
+            else
+                idset=""
+                [[ -n $cfg_user ]]  && idset="U"
+                [[ -n $cfg_group ]] && idset="${idset:+$idset+}G"
+                [[ -z $idset ]]     && idset="root"
+            fi
+
+            # Run-as user: prefer the live process; fall back to the configured
+            # User= / DynamicUser / systemd default (root). A trailing '*' marks
+            # a value taken from config rather than observed on a running PID.
+            runas=""
+            if (( mainpid > 0 )); then
+                runas=$(ps -o user= -p "$mainpid" 2>/dev/null | awk 'NR==1{print $1}')
+                [[ -z $runas && -r /proc/$mainpid/status ]] && {
+                    ruid=$(awk '/^Uid:/{print $2; exit}' "/proc/$mainpid/status" 2>/dev/null)
+                    [[ -n $ruid ]] && runas=$(id -nu "$ruid" 2>/dev/null || printf 'uid=%s' "$ruid")
+                }
+            fi
+            if [[ -z $runas ]]; then
+                if   [[ -n $cfg_user ]];    then runas="${cfg_user}*"
+                elif [[ $dynuser == yes ]]; then runas="dynamic*"
+                else                             runas="root*"; fi
+            fi
+
+            # ExecStart tokens grepped straight from the unit file + drop-ins
+            # (strip the leading special prefixes @ - + ! : systemd allows).
+            execfiles=()
+            [[ -n ${S[FragmentPath]:-} ]] && execfiles+=("${S[FragmentPath]}")
+            if [[ -n ${S[DropInPaths]:-} ]]; then read -ra _di <<<"${S[DropInPaths]}"; execfiles+=("${_di[@]}"); fi
+            raw_tokens=()
+            if (( ${#execfiles[@]} )); then
+                mapfile -t raw_tokens < <(
+                    grep -hE '^[[:space:]]*ExecStart[[:space:]]*=' "${execfiles[@]}" 2>/dev/null \
+                      | sed -E 's/^[[:space:]]*ExecStart[[:space:]]*=[[:space:]]*//; s/^[-@+!:]+//' \
+                      | awk '{print $1}' | sed '/^$/d'
+                )
+            fi
+            # Resolved binary path as systemd parsed it (for the writable check).
+            execresolved=$(sed -n 's/.*[ {]path=\([^ ;]*\).*/\1/p' <<<"${S[ExecStart]:-}" | head -n1)
+            first_exec=${raw_tokens[0]:-$execresolved}
+            exec_disp=${first_exec:--}
+            (( ${#raw_tokens[@]} > 1 )) && exec_disp+=" (+$((${#raw_tokens[@]}-1)))"
+
+            row_hit=0
+            # Non-absolute ExecStart token -> PATH-resolution / tamper risk.
+            for tok in ${raw_tokens[@]+"${raw_tokens[@]}"}; do
+                case $tok in
+                    /*) ;;
+                    %*) RELATIVE_EXEC+=("$svc  ExecStart uses a systemd specifier path: $tok"); row_hit=1 ;;
+                    *)  RELATIVE_EXEC+=("$svc  ExecStart uses a NON-absolute path: $tok");      row_hit=1 ;;
+                esac
+            done
+            # Resolved ExecStart binary writable by me -> direct code-exec vector.
+            [[ -z $execresolved && $first_exec == /* ]] && execresolved=$first_exec
+            if [[ -n $execresolved && $execresolved == /* && -w $execresolved ]]; then
+                WRITABLE_EXEC+=("$svc  ExecStart binary WRITABLE by me: $execresolved (runs as ${runas%\*})"); row_hit=1
+            fi
+            # Active/enabled service with no explicit User= and DynamicUser=no
+            # -> runs as unconfined root (the specific posture asked about).
+            if [[ -z $cfg_user && $dynuser != yes ]] \
+               && { [[ ${S[ActiveState]:-} == active ]] || [[ $boot == enabled ]]; }; then
+                grp_note=""; [[ -n $cfg_group ]] && grp_note=" Group=$cfg_group"
+                ROOT_NOISO+=("$svc  no User=, DynamicUser=no${grp_note}  (state=$state boot=$boot exec=${first_exec:-?})")
+            fi
+
+            line=$(printf '%-30.30s %-16.16s %-9.9s %-14.14s %-6.6s %s' \
+                   "$svc" "$state" "$boot" "$runas" "$idset" "$exec_disp")
+            if (( row_hit )); then hit "$line"; else info "$line"; fi
+            unset S
+        done
+        dim "RUN-AS '*' = from unit config (service not live); no '*' = observed on the running MainPID. STATE=ActiveState/SubState, BOOT=UnitFileState."
+        dim "ID (identity posture): U+G=explicit User and Group, U/G=only one set, dyn=DynamicUser=yes, root=no User/Group and DynamicUser=no (unconfined root)."
+
+        sub "ExecStart commands with NON-absolute paths (relative / specifier)"
+        if (( ${#RELATIVE_EXEC[@]} )); then
+            printf '%s\n' "${RELATIVE_EXEC[@]}" | sort -u | while IFS= read -r l; do hit "$l"; done
+            dim "A relative or bare-name ExecStart is resolved via systemd's own PATH - a hijack vector if any PATH dir is writable."
+        else
+            ok "every ExecStart in the scanned units uses an absolute path"
+        fi
+
+        sub "ExecStart executables writable by current user"
+        if (( ${#WRITABLE_EXEC[@]} )); then
+            printf '%s\n' "${WRITABLE_EXEC[@]}" | sort -u | while IFS= read -r l; do hit "$l"; done
+        else
+            dim "none of the scanned ExecStart binaries are writable by ${ME:-this user}"
+        fi
+
+        sub "services effectively running as root (no explicit User=, DynamicUser=no)"
+        if (( ${#ROOT_NOISO[@]} )); then
+            printf '%s\n' "${ROOT_NOISO[@]}" | sort -u | cap | while IFS= read -r l; do info "$l"; done
+            dim "Expected for many core daemons; listed so the root-privileged attack surface is explicit. An explicit User=/Group= or DynamicUser=yes shrinks it."
+        else
+            ok "no active/enabled service runs as unconfined root (all set User= or DynamicUser=yes)"
+        fi
+    fi
+else
+    missing systemctl
+    [[ -d /etc/init.d ]] && { sub "SysV init scripts (no systemd)"; ls -la /etc/init.d 2>/dev/null | indent; }
+fi
+
+# ===========================================================================
+# 21. SYSTEM DAEMONS - sensitive information
 #     (inspect unit files, systemctl environment, and /proc/<pid>/environ)
 # ===========================================================================
 section "SYSTEM DAEMONS - SENSITIVE INFORMATION"
