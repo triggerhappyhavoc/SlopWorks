@@ -95,8 +95,31 @@ fi
 is_debian() { [[ $OS_ID == debian || $OS_ID == ubuntu || $OS_LIKE == *debian* ]] || have dpkg-query; }
 is_redhat() { [[ $OS_ID == rhel || $OS_ID == centos || $OS_ID == fedora || $OS_ID == rocky || $OS_ID == almalinux || $OS_ID == redhat || $OS_LIKE == *rhel* || $OS_LIKE == *fedora* ]] || have rpm; }
 
-# Groups that confer (near) root. Membership is a red flag.
-PRIV_GROUPS='root sudo wheel admin adm docker lxd disk shadow'
+# Groups whose membership is a path to root on its own. sudo/wheel/admin
+# (SUDO_GROUPS) are root-capable only because stock sudoers/polkit configs grant
+# them, so where those configs are readable the LOCAL USERS check uses the actual
+# rules instead of the group name.
+PRIV_GROUPS_ROOT='sudo wheel admin docker lxd incus-admin libvirt libvirtd disk microk8s'
+SUDO_GROUPS='sudo wheel admin'
+# Groups granting privileged READ access - useful for escalation, not root alone.
+PRIV_GROUPS_PARTIAL='root adm shadow systemd-journal'
+# priv_group_note GROUP -> sets PG_NOTE to why the group matters; false if it doesn't.
+priv_group_note() {
+    case $1 in
+        sudo|wheel|admin) PG_NOTE="conventional sudo group" ;;
+        docker)           PG_NOTE="docker daemon access, root via a host mount" ;;
+        lxd|incus-admin)  PG_NOTE="privileged container with the host / mounted" ;;
+        libvirt|libvirtd) PG_NOTE="manages system VMs, can attach host disks" ;;
+        disk)             PG_NOTE="raw block-device access (debugfs)" ;;
+        microk8s)         PG_NOTE="cluster admin, privileged pods" ;;
+        root)             PG_NOTE="GID 0, reads root-group files such as /etc/sudoers" ;;
+        adm)              PG_NOTE="reads most of /var/log" ;;
+        shadow)           PG_NOTE="reads /etc/shadow hashes" ;;
+        systemd-journal)  PG_NOTE="reads the full systemd journal" ;;
+        *) PG_NOTE=""; return 1 ;;
+    esac
+}
+in_list() { case " $2 " in *" $1 "*) return 0 ;; esac; return 1; }   # in_list WORD "SPACE LIST"
 # Pattern that looks sensitive in history / env / config files.
 SENSITIVE_RE='pass(wd|word)?=|secret|token|api[_-]?key|private[_-]?key|credential|BEGIN [A-Z ]*PRIVATE KEY|aws_(secret|access)|-p[^ ]+|--password'
 
@@ -353,9 +376,9 @@ info "id:     $(id 2>/dev/null)"
 sub "group memberships"
 info "${MY_GROUPS:-?}"
 for g in $MY_GROUPS; do
-    for pg in $PRIV_GROUPS; do
-        [[ $g == "$pg" ]] && hit "member of privileged group '$g'"
-    done
+    priv_group_note "$g" || continue
+    if in_list "$g" "$PRIV_GROUPS_ROOT"; then hit "member of root-capable group '$g' ($PG_NOTE)"
+    else hit "member of privileged-read group '$g' ($PG_NOTE)"; fi
 done
 (( AM_ROOT )) && hit "running as root (uid 0)"
 
@@ -407,38 +430,625 @@ is_interactive_shell() {
     [[ -z $valid_shells ]] && return 0        # no /etc/shells to check against: assume yes
     grep -qxF "$1" <<<"$valid_shells"
 }
-can_elevate() {                               # $1 = username
-    local u=$1 grps
-    grps=$(id -nG "$u" 2>/dev/null)
-    for g in $grps; do
-        for pg in $PRIV_GROUPS; do [[ $g == "$pg" ]] && return 0; done
-    done
-    grep -rhsE "^[[:space:]]*${u}[[:space:]]" /etc/sudoers /etc/sudoers.d/ 2>/dev/null | grep -q . && return 0
-    return 1
+# --- Privilege sources ------------------------------------------------------
+# Every account is checked against each local source that can hand out root:
+#   groups   PRIV_GROUPS_ROOT / PRIV_GROUPS_PARTIAL (top of file)
+#   sudoers  /etc/sudoers plus the files it includes, parsed the way sudo reads
+#            them (User_Alias, %group, %#gid, #uid, ALL, '!' negation, comma
+#            lists, Runas specs, Cmnd_Alias), so each grant is judged by what it
+#            allows rather than by the user merely being named
+#   doas     /etc/doas.conf, /usr/local/etc/doas.conf
+#   polkit   admin identities (addAdminRule / AdminIdentities=) and rules or
+#            .pkla entries that grant actions without admin authentication
+#   pam_cap  /etc/security/capability.conf, when pam_cap.so is in /etc/pam.d
+# PRIV-CAPABLE = a path to root: sudo/doas ALL or a GTFOBins/wildcard command
+#   as root, polkit admin, a root-equivalent group, an ambient dangerous cap.
+# PRIV-LIMITED = elevated rights short of root: specific commands, another
+#   runas user, log/hash-reading groups, inheritable-only capabilities.
+# Sources that exist but cannot be read are listed, so a clean result from an
+# unprivileged run is never mistaken for a complete one.
+PC_FS=$'\034'; PC_US=$'\037'     # parser output: field / list-item separators
+PC_UNREAD=()
+
+# -- sudoers --
+SUDO_PRESENT=0; { have sudo || [[ -x /usr/bin/sudo || -x /bin/sudo ]]; } && SUDO_PRESENT=1
+SU_FILES=() SU_UNREAD=()
+SU_SRC=() SU_USERS=() SU_RUNAS=() SU_RTEXT=() SU_TAGS=() SU_CMD=() SU_ROOT=() SU_RANK=() SU_DESC=()
+declare -A SU_SEEN=() SU_UA=() SU_RA=() SU_CA=()
+# Collect FILE and, depth-first, what it includes, in sudo's order: relative
+# paths resolve against the including file's directory, %h is the short
+# hostname, and an includedir skips names containing '.' or ending in '~'.
+sudoers_walk() {     # sudoers_walk FILE DEPTH
+    local f=$1 line path isdir
+    local re='^[[:space:]]*[@#]include(dir)?[[:space:]]+(.*[^[:space:]])[[:space:]]*$'
+    (( $2 > 8 )) && return
+    [[ -e $f && -z ${SU_SEEN[$f]-} ]] || return
+    SU_SEEN[$f]=1
+    if [[ ! -r $f ]]; then SU_UNREAD+=("$f"); return; fi
+    SU_FILES+=("$f")
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line =~ $re ]] || continue
+        isdir=${BASH_REMATCH[1]} path=${BASH_REMATCH[2]}
+        path=${path#\"}; path=${path%\"}; path=${path//"%h"/${HOSTNAME%%.*}}
+        [[ $path == /* ]] || path=${f%/*}/$path
+        if [[ -n $isdir ]]; then sudoers_walk_dir "$path" $(( $2 + 1 ))
+        else sudoers_walk "$path" $(( $2 + 1 )); fi
+    done < "$f"
 }
+sudoers_walk_dir() {     # sudoers_walk_dir DIR DEPTH
+    local e base
+    [[ -d $1 ]] || return
+    if [[ ! -r $1 || ! -x $1 ]]; then SU_UNREAD+=("$1/"); return; fi
+    for e in "$1"/*; do
+        base=${e##*/}
+        [[ -f $e && $base != *.* && $base != *'~' ]] && sudoers_walk "$e" "$2"
+    done
+}
+# Parse sudoers files into records (fields split by \034, lists by \037):
+#   UA|RA|CA <name> <member>                           alias definitions
+#   R <file:line> <users> <runas-users> <runas-text> <tags> <command>
+# <runas-users> is DEFAULT (no Runas spec: root) or SELF (group-only spec).
+sudoers_parse() {
+    awk '
+    BEGIN { FS_ = "\034"; US = "\037"
+            OPTRE = "^(ROLE|TYPE|CWD|CHROOT|NOTBEFORE|NOTAFTER|TIMEOUT|APPARMOR_PROFILE|PRIVS|LIMITPRIVS)$" }
+    function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+    # "#" starts a comment unless a digit follows (#uid, %#gid); "\#" is literal.
+    function strip_comment(s,    i, n, c) {
+        n = length(s)
+        for (i = 1; i <= n; i++) {
+            c = substr(s, i, 1)
+            if (c == "\\") { i++; continue }
+            if (c == "#" && substr(s, i + 1, 1) !~ /[0-9]/) return substr(s, 1, i - 1)
+        }
+        return s
+    }
+    # Split s on sep outside parentheses, keeping backslash escapes.
+    function split_top(s, arr, sep,    i, n, c, depth, cur, k) {
+        n = length(s); depth = 0; cur = ""; k = 0
+        for (i = 1; i <= n; i++) {
+            c = substr(s, i, 1)
+            if (c == "\\" && i < n) { cur = cur c substr(s, i + 1, 1); i++; continue }
+            if (c == "(") depth++
+            else if (c == ")" && depth > 0) depth--
+            if (c == sep && depth == 0) { arr[++k] = trim(cur); cur = ""; continue }
+            cur = cur c
+        }
+        arr[++k] = trim(cur)
+        return k
+    }
+    function joinlist(s,    a, n, i, out) {
+        n = split_top(s, a, ","); out = ""
+        for (i = 1; i <= n; i++) if (a[i] != "") out = out (out == "" ? "" : US) a[i]
+        return out
+    }
+    # Length of the first word, honouring "quotes" and backslash escapes.
+    function word_len(s,    i, n, c, inq) {
+        n = length(s); inq = 0
+        for (i = 1; i <= n; i++) {
+            c = substr(s, i, 1)
+            if (c == "\\") { i++; continue }
+            if (c == "\"") { inq = !inq; continue }
+            if (!inq && (c == " " || c == "\t")) return i - 1
+        }
+        return n
+    }
+    # Position of the ":" that starts the next "Host_List =" spec, or 0.
+    function find_hostsep(body,    off, tail, tok) {
+        off = 0
+        while (match(substr(body, off + 1), /:[ \t]*[^ \t=():]+[ \t]*=/)) {
+            tail = substr(body, off + 1)
+            tok = trim(substr(tail, RSTART + 1, RLENGTH - 2))
+            if (tok !~ OPTRE) return off + RSTART
+            off += RSTART
+        }
+        return 0
+    }
+    function do_alias(kw, rest,    tag, name, body, n, a, i) {
+        tag = ""
+        if (kw == "User_Alias") tag = "UA"
+        else if (kw == "Runas_Alias") tag = "RA"
+        else if (kw == "Cmnd_Alias" || kw == "Cmd_Alias") tag = "CA"
+        while (match(rest, /^[A-Z][A-Z0-9_]*[ \t]*=/)) {
+            name = trim(substr(rest, 1, RLENGTH - 1))
+            body = substr(rest, RLENGTH + 1); rest = ""
+            if (match(body, /:[ \t]*[A-Z][A-Z0-9_]*[ \t]*=/)) {
+                rest = trim(substr(body, RSTART + 1)); body = substr(body, 1, RSTART - 1)
+            }
+            if (tag == "") continue
+            n = split_top(body, a, ",")
+            for (i = 1; i <= n; i++) if (a[i] != "") print tag FS_ name FS_ a[i]
+        }
+    }
+    function do_userspec(s, src,    L, users, rest, p, body, nxt, n, items, i, it, rt, q, ru, rtext, nopw, setenv, t, tags) {
+        gsub(/[ \t]*,[ \t]*/, ",", s); gsub(/![ \t]+/, "!", s)
+        L = word_len(s)
+        users = joinlist(substr(s, 1, L)); rest = trim(substr(s, L + 1))
+        while (rest != "") {
+            if (!(p = index(rest, "="))) return
+            body = substr(rest, p + 1); rest = ""
+            if ((nxt = find_hostsep(body))) { rest = trim(substr(body, nxt + 1)); body = substr(body, 1, nxt - 1) }
+            ru = "DEFAULT"; rtext = ""; nopw = 0; setenv = 0
+            n = split_top(body, items, ",")
+            for (i = 1; i <= n; i++) {
+                it = items[i]
+                if (substr(it, 1, 1) == "(" && (q = index(it, ")")) > 0) {
+                    rt = substr(it, 2, q - 2); it = trim(substr(it, q + 1))
+                    gsub(/[ \t]/, "", rt); rtext = "(" rt ")"
+                    q = index(rt, ":"); ru = q ? substr(rt, 1, q - 1) : rt
+                    if (ru == "") ru = q ? "SELF" : "DEFAULT"; else ru = joinlist(ru)
+                }
+                while (1) {        # Option_Spec, Tag_Spec and digest prefixes before the command
+                    if (match(it, /^[A-Z_]+[ \t]*=[ \t]*[^ \t]*[ \t]*/)) {
+                        t = trim(substr(it, 1, index(it, "=") - 1))
+                        if (t ~ OPTRE) { it = substr(it, RLENGTH + 1); continue }
+                    }
+                    if (match(it, /^[A-Z_]+:[ \t]*/)) {
+                        t = substr(it, 1, index(it, ":") - 1)
+                        if (t == "NOPASSWD") nopw = 1
+                        else if (t == "PASSWD") nopw = 0
+                        else if (t == "SETENV") setenv = 1
+                        else if (t == "NOSETENV") setenv = 0
+                        it = substr(it, RLENGTH + 1); continue
+                    }
+                    if (match(it, /^sha(224|256|384|512):[^ \t]+[ \t]+/)) { it = substr(it, RLENGTH + 1); continue }
+                    break
+                }
+                it = trim(it)
+                if (it == "") continue
+                tags = nopw ? "NOPASSWD" : ""
+                if (setenv) tags = tags (tags == "" ? "" : " ") "SETENV"
+                print "R" FS_ src FS_ users FS_ ru FS_ rtext FS_ tags FS_ it
+            }
+        }
+    }
+    FNR == 1 { buf = "" }
+    {
+        line = $0; sub(/\r$/, "", line)
+        if (buf == "") start = FNR
+        if (line ~ /\\$/ && (buf != "" || line !~ /^[ \t]*#([^0-9]|$)/)) {
+            buf = buf substr(line, 1, length(line) - 1) " "; next
+        }
+        line = buf line; buf = ""
+        if (line ~ /^[ \t]*[@#]include/) next
+        s = trim(strip_comment(line))
+        if (s == "" || s ~ /^Defaults([:@>!]|[ \t]|$)/) next
+        if (s ~ /^(User_Alias|Runas_Alias|Host_Alias|Cmnd_Alias|Cmd_Alias)[ \t]/) {
+            kw = s; sub(/[ \t].*$/, "", kw)
+            rest = s; sub(/^[A-Za-z_]+[ \t]+/, "", rest)
+            do_alias(kw, rest); next
+        }
+        do_userspec(s, FILENAME ":" start)
+    }' "$@"
+}
+su_alias() {         # su_alias NAME -> SU_ALIAS_VAL from the User_Alias (M_ALIAS=U) or Runas_Alias (R) table
+    if [[ $M_ALIAS == R ]]; then [[ -n ${SU_RA[$1]+x} ]] && SU_ALIAS_VAL=${SU_RA[$1]}
+    else [[ -n ${SU_UA[$1]+x} ]] && SU_ALIAS_VAL=${SU_UA[$1]}; fi
+}
+# su_match LIST DEPTH -> 0 allowed, 1 denied, 2 no match, for the identity in
+# M_NAME/M_UID/M_GROUPS/M_GIDS. As in sudo, the LAST item that matches decides
+# and '!' inverts it, so "ALL, !alice" excludes alice.
+su_match() {
+    local item neg r i
+    local -a items
+    (( $2 > 8 )) && return 2
+    IFS=$PC_US read -ra items <<<"$1"
+    for (( i = ${#items[@]} - 1; i >= 0; i-- )); do
+        item=${items[i]} neg=0 r=2
+        while [[ $item == '!'* ]]; do item=${item:1}; neg=$(( !neg )); done
+        item=${item//\"/}
+        case $item in
+            ALL)        r=0 ;;
+            '%:'*|'+'*) ;;                       # non-Unix group / netgroup: not evaluated
+            '%#'*)      in_list "${item:2}" "$M_GIDS" && r=0 ;;
+            '%'*)       in_list "${item:1}" "$M_GROUPS" && r=0 ;;
+            '#'*)       [[ ${item:1} == "$M_UID" ]] && r=0 ;;
+            *)  if [[ $item =~ ^[A-Z][A-Z0-9_]*$ ]] && su_alias "$item"; then
+                    su_match "$SU_ALIAS_VAL" $(( $2 + 1 )); r=$?
+                else
+                    [[ ${item//\\/} == "$M_NAME" ]] && r=0
+                fi ;;
+        esac
+        (( r == 2 )) && continue
+        (( neg )) && r=$(( 1 - r ))
+        return "$r"
+    done
+    return 2
+}
+# su_cmd_rank CMD DEPTH -> CR = 3 (ALL), 2 (root via a GTFOBins or wildcard
+# command), 1 (specific commands), 0 (nothing), and CD = a short description.
+su_cmd_rank() {
+    local cmd=$1 path base m best=0 bestd=""
+    local -a ms
+    CR=0 CD=""
+    [[ $cmd == '!'* || $2 -gt 8 ]] && return       # a negated command restricts, never grants
+    if [[ $cmd == ALL ]]; then CR=3 CD=ALL; return; fi
+    if [[ $cmd =~ ^[A-Z][A-Z0-9_]*$ && -n ${SU_CA[$cmd]+x} ]]; then
+        IFS=$PC_US read -ra ms <<<"${SU_CA[$cmd]}"
+        for m in ${ms[@]+"${ms[@]}"}; do
+            su_cmd_rank "$m" $(( $2 + 1 ))
+            (( CR > best )) && best=$CR bestd=$CD
+        done
+        CR=$best CD=$cmd
+        (( best >= 2 )) && CD+=" -> $bestd"
+        return
+    fi
+    path=${cmd%%[[:space:]]*} base=${path##*/}
+    if [[ $path == sudoedit ]]; then CR=1 CD=$cmd
+    elif [[ $path == */ || $path == *[*?[]* ]]; then CR=2 CD="$path (wildcard)"
+    elif [[ $base =~ ^($GTFO)$ ]]; then CR=2 CD="$path (GTFOBins)"
+    else CR=1 CD=$cmd; fi
+}
+if (( SUDO_PRESENT )) && [[ -e /etc/sudoers ]]; then
+    sudoers_walk /etc/sudoers 0
+    # A root-only /etc/sudoers hides its include list: fall back to the stock includedir.
+    [[ -r /etc/sudoers ]] || sudoers_walk_dir /etc/sudoers.d 1
+fi
+if (( ${#SU_FILES[@]} )); then
+    while IFS=$PC_FS read -r k a b c d e f; do
+        case $k in
+            UA) SU_UA[$a]=${SU_UA[$a]-}${SU_UA[$a]+$PC_US}$b ;;
+            RA) SU_RA[$a]=${SU_RA[$a]-}${SU_RA[$a]+$PC_US}$b ;;
+            CA) SU_CA[$a]=${SU_CA[$a]-}${SU_CA[$a]+$PC_US}$b ;;
+            R)  SU_SRC+=("$a") SU_USERS+=("$b") SU_RUNAS+=("$c") SU_RTEXT+=("$d") SU_TAGS+=("$e") SU_CMD+=("$f") ;;
+        esac
+    done < <(sudoers_parse "${SU_FILES[@]}")
+    # Rank each grant once: does its Runas list include root, and what does it run?
+    M_NAME=root M_UID=0 M_GROUPS=$(id -nG root 2>/dev/null) M_GIDS=$(id -G root 2>/dev/null) M_ALIAS=R
+    for (( i = 0; i < ${#SU_CMD[@]}; i++ )); do
+        case ${SU_RUNAS[i]} in
+            DEFAULT) SU_ROOT[i]=1 ;;
+            SELF)    SU_ROOT[i]=0 ;;
+            *)       if su_match "${SU_RUNAS[i]}" 0; then SU_ROOT[i]=1; else SU_ROOT[i]=0; fi ;;
+        esac
+        su_cmd_rank "${SU_CMD[i]}" 0; SU_RANK[i]=$CR SU_DESC[i]=$CD
+    done
+fi
+
+# -- doas --
+DOAS_PRESENT=0; { have doas || [[ -x /usr/bin/doas || -x /usr/local/bin/doas ]]; } && DOAS_PRESENT=1
+DO_FILES=() DO_ACT=() DO_ID=() DO_TGT=() DO_CMD=() DO_OPTS=() DO_SRC=()
+# doas.conf: permit|deny [options] identity [as target] [cmd command [args ...]]
+# -> D <permit|deny> <identity> <target> <command> <options> <file:line>
+doas_parse() {
+    awk '
+    BEGIN { FS_ = "\034" }
+    FNR == 1 { buf = "" }
+    {
+        line = $0; sub(/\r$/, "", line)
+        if (buf == "") start = FNR
+        if (line ~ /\\$/) { buf = buf substr(line, 1, length(line) - 1) " "; next }
+        line = buf line; buf = ""
+        sub(/#.*/, "", line)
+        n = split(line, t)
+        if (n == 0 || (t[1] != "permit" && t[1] != "deny")) next
+        i = 2; opts = ""
+        while (i <= n) {
+            if (t[i] == "setenv") {
+                i++
+                if (t[i] ~ /^[{]/) while (i <= n && t[i] !~ /[}]$/) i++
+                i++; continue
+            }
+            if (t[i] ~ /^(nopass|nolog|persist|keepenv)$/) { opts = opts (opts == "" ? "" : ",") t[i]; i++; continue }
+            break
+        }
+        ident = t[i++]; target = ""; cmd = ""
+        if (t[i] == "as") { target = t[i + 1]; i += 2 }
+        if (t[i] == "cmd") { cmd = t[i + 1]; for (i += 2; i <= n; i++) cmd = cmd " " t[i] }
+        print "D" FS_ t[1] FS_ ident FS_ target FS_ cmd FS_ opts FS_ FILENAME ":" start
+    }' "$@"
+}
+for f in /etc/doas.conf /usr/local/etc/doas.conf; do
+    [[ -e $f ]] || continue
+    if [[ -r $f ]]; then DO_FILES+=("$f"); else PC_UNREAD+=("$f"); fi
+done
+if (( DOAS_PRESENT && ${#DO_FILES[@]} )); then
+    while IFS=$PC_FS read -r k a b c d e f; do
+        DO_ACT+=("$a") DO_ID+=("$b") DO_TGT+=("$c") DO_CMD+=("$d") DO_OPTS+=("$e") DO_SRC+=("$f")
+    done < <(doas_parse "${DO_FILES[@]}")
+fi
+
+# -- polkit --
+PK_RULES=() PK_LA=() PK_KIND=() PK_ID=() PK_ACT=() PK_SRC=()
+declare -A PK_SEEN=()
+# JavaScript rules -> PA <identity> "" <file:line> for each addAdminRule identity,
+# and PY <identity> <actions> <file:line> for each addRule block that returns
+# YES/AUTH_SELF for a named user/group. <actions> lists the action ids it tests
+# (prefix tests end in '*'); '*' = no action test at all, i.e. every action.
+polkit_rules_parse() {
+    awk -v q="'" '
+    BEGIN { FS_ = "\034" }
+    function cnt(s, ch,    n, i) { n = 0; for (i = 1; i <= length(s); i++) if (substr(s, i, 1) == ch) n++; return n }
+    function qstr(m,    p) { p = index(m, "\""); m = substr(m, p + 1); return substr(m, 1, index(m, "\"") - 1) }
+    function emit(kind, id, acts) { print kind FS_ id FS_ acts FS_ FILENAME ":" start }
+    function flush(    s, t, m, a, acts) {
+        s = blk
+        if (mode == "A") {
+            while (match(s, /unix-(user|group|netgroup):[-A-Za-z0-9_.@$]+/)) {
+                emit("PA", substr(s, RSTART, RLENGTH), ""); s = substr(s, RSTART + RLENGTH)
+            }
+            return
+        }
+        if (s !~ /polkit\.Result\.(YES|AUTH_SELF)/) return
+        acts = ""; t = s
+        while (match(t, /(action\.id[ \t]*===?[ \t]*|indexOf\([ \t]*|startsWith\([ \t]*)"[^"]*"/)) {
+            m = substr(t, RSTART, RLENGTH); t = substr(t, RSTART + RLENGTH)
+            a = qstr(m); if (m !~ /^action/) a = a "*"
+            acts = acts (acts == "" ? "" : ",") a
+        }
+        if (acts == "") acts = (s ~ /action\./) ? "(filtered)" : "*"
+        t = s
+        while (match(t, /isInGroup\([ \t]*"[^"]*"/)) {
+            emit("PY", "unix-group:" qstr(substr(t, RSTART, RLENGTH)), acts); t = substr(t, RSTART + RLENGTH)
+        }
+        t = s
+        while (match(t, /subject\.user[ \t]*===?[ \t]*"[^"]*"/)) {
+            emit("PY", "unix-user:" qstr(substr(t, RSTART, RLENGTH)), acts); t = substr(t, RSTART + RLENGTH)
+        }
+    }
+    FNR == 1 { incom = 0; mode = "" }
+    {
+        line = $0; sub(/\r$/, "", line); gsub(q, "\"", line)
+        out = ""                       # line with /* */ and // comments removed
+        while (line != "") {
+            if (incom) {
+                p = index(line, "*/")
+                if (p == 0) line = ""; else { line = substr(line, p + 2); incom = 0 }
+                continue
+            }
+            p = index(line, "/*"); c = index(line, "//")
+            if (c > 0 && (p == 0 || c < p)) { out = out substr(line, 1, c - 1); line = ""; continue }
+            if (p > 0) { out = out substr(line, 1, p - 1); line = substr(line, p + 2); incom = 1; continue }
+            out = out line; line = ""
+        }
+        if (mode == "") {
+            if (out ~ /addAdminRule[ \t]*\(/) mode = "A"
+            else if (out ~ /addRule[ \t]*\(/) mode = "R"
+            if (mode != "") { blk = ""; depth = 0; opened = 0; start = FNR }
+        }
+        if (mode != "") {
+            blk = blk " " out
+            o = cnt(out, "{"); depth += o - cnt(out, "}"); if (o) opened = 1
+            if (opened && depth <= 0) { flush(); mode = "" }
+        }
+    }' "$@"
+}
+# Local-authority backend: AdminIdentities= in localauthority.conf.d (the last
+# file wins) and .pkla sections whose Result* is yes/auth_self.
+polkit_pkla_parse() {
+    awk '
+    BEGIN { FS_ = "\034" }
+    function pflush(    n, a, i) {
+        if (ids != "" && grant) {
+            n = split(ids, a, ";")
+            for (i = 1; i <= n; i++) if (a[i] != "") print "PY" FS_ a[i] FS_ acts FS_ src
+        }
+        ids = ""; acts = ""; grant = 0
+    }
+    { sub(/\r$/, "") }
+    FNR == 1 { pflush() }
+    /^[ \t]*\[/ { pflush(); src = FILENAME ":" FNR; next }
+    /^[ \t]*Identity[ \t]*=/ { v = $0; sub(/^[^=]*=[ \t]*/, "", v); ids = v; next }
+    /^[ \t]*Action[ \t]*=/   { v = $0; sub(/^[^=]*=[ \t]*/, "", v); gsub(/;/, ",", v); acts = v; next }
+    /^[ \t]*Result(Any|Inactive|Active)[ \t]*=[ \t]*(yes|auth_self)/ { grant = 1; next }
+    /^[ \t]*AdminIdentities[ \t]*=/ { v = $0; sub(/^[^=]*=[ \t]*/, "", v); admin = v; asrc = FILENAME ":" FNR }
+    END {
+        pflush()
+        n = split(admin, a, ";")
+        for (i = 1; i <= n; i++) if (a[i] != "") print "PA" FS_ a[i] FS_ "" FS_ asrc
+    }' "$@"
+}
+# Rules dirs in polkit priority order; a same-named file earlier in the list
+# overrides a later one, so only the first copy of each name is read.
+for d in /etc/polkit-1/rules.d /run/polkit-1/rules.d /usr/local/share/polkit-1/rules.d /usr/share/polkit-1/rules.d; do
+    [[ -d $d ]] || continue
+    if [[ ! -r $d || ! -x $d ]]; then PC_UNREAD+=("$d/"); continue; fi
+    for f in "$d"/*.rules; do
+        [[ -f $f && -z ${PK_SEEN[${f##*/}]-} ]] || continue
+        PK_SEEN[${f##*/}]=1
+        if [[ -r $f ]]; then PK_RULES+=("$f"); else PC_UNREAD+=("$f"); fi
+    done
+done
+for d in /etc/polkit-1/localauthority /var/lib/polkit-1/localauthority; do
+    [[ -d $d && ! ( -r $d && -x $d ) ]] && PC_UNREAD+=("$d/")
+done
+for f in /etc/polkit-1/localauthority.conf.d/*.conf /etc/polkit-1/localauthority/*/*.pkla \
+         /var/lib/polkit-1/localauthority/*/*.pkla; do
+    [[ -f $f ]] || continue
+    if [[ -r $f ]]; then PK_LA+=("$f"); else PC_UNREAD+=("$f"); fi
+done
+while IFS=$PC_FS read -r k a b c; do
+    PK_KIND+=("$k") PK_ID+=("$a") PK_ACT+=("$b") PK_SRC+=("$c")
+done < <(
+    (( ${#PK_RULES[@]} )) && polkit_rules_parse "${PK_RULES[@]}"
+    (( ${#PK_LA[@]} )) && polkit_pkla_parse "${PK_LA[@]}"
+)
+
+# -- pam_cap --
+# capability.conf: "<caps> <user|@group|*> ..."; pam_cap applies the FIRST line
+# that matches. A '^' prefix also raises the cap as AMBIENT (live in the login
+# shell); plain caps are inheritable only and need a binary carrying matching
+# file caps; '!' drops a cap from the bounding set.
+PC_DANGER_CAPS='all cap_setuid cap_setgid cap_sys_admin cap_dac_override cap_dac_read_search cap_sys_ptrace cap_sys_module cap_chown cap_fowner cap_setfcap cap_sys_rawio'
+PAMCAP_ACTIVE=0; CAP_SPEC=() CAP_WHO=() CAP_SRC=()
+CAPCONF=/etc/security/capability.conf
+if [[ -e $CAPCONF ]]; then
+    grep -qsE '^[[:space:]]*[^#[:space:]]+[[:space:]].*pam_cap\.so' /etc/pam.d/* && PAMCAP_ACTIVE=1
+    if [[ -r $CAPCONF ]]; then
+        n=0
+        while read -r spec who || [[ -n ${spec-} ]]; do
+            n=$(( n + 1 ))
+            [[ -z $spec || $spec == '#'* ]] && continue
+            CAP_SPEC+=("$spec") CAP_WHO+=("${who%%#*}") CAP_SRC+=("$CAPCONF:$n")
+        done < "$CAPCONF"
+    else
+        PC_UNREAD+=("$CAPCONF")
+    fi
+fi
+
+# -- per-account evaluation: fills R_CAP (paths to root) and R_LIM (limited) --
+pc_eval_sudo() {
+    local i who
+    for (( i = 0; i < ${#SU_CMD[@]}; i++ )); do
+        (( SU_RANK[i] )) || continue
+        su_match "${SU_USERS[i]}" 0 || continue
+        who=${SU_USERS[i]//$PC_US/,}
+        [[ $who == "$M_NAME" ]] && who="" || who=" [$who]"
+        r="sudo$who ${SU_RTEXT[i]:-(root)} ${SU_DESC[i]}${SU_TAGS[i]:+ ${SU_TAGS[i]}}  @${SU_SRC[i]}"
+        if (( SU_ROOT[i] && SU_RANK[i] >= 2 )); then R_CAP+=("$r"); else R_LIM+=("$r"); fi
+    done
+}
+pc_eval_doas() {        # rules apply in order and the last match wins, so a later deny-all clears earlier grants
+    local i id tgt who
+    local -a cap=() lim=()
+    for (( i = 0; i < ${#DO_ACT[@]}; i++ )); do
+        id=${DO_ID[i]} who=""
+        if [[ $id == :* ]]; then in_list "${id:1}" "$M_GROUPS $M_GIDS" || continue; who=" [$id]"
+        else [[ $id == "$M_NAME" || $id == "$M_UID" ]] || continue; fi
+        tgt=${DO_TGT[i]:-root}
+        if [[ ${DO_ACT[i]} == deny ]]; then
+            [[ -z ${DO_CMD[i]} && ( $tgt == root || $tgt == 0 ) ]] && cap=() lim=()
+            continue
+        fi
+        CR=3 CD="any command"
+        [[ -n ${DO_CMD[i]} ]] && su_cmd_rank "${DO_CMD[i]}" 0
+        r="doas$who as $tgt: $CD${DO_OPTS[i]:+ ${DO_OPTS[i]}}  @${DO_SRC[i]}"
+        if [[ ( $tgt == root || $tgt == 0 ) ]] && (( CR >= 2 )); then cap+=("$r"); else lim+=("$r"); fi
+    done
+    R_CAP+=(${cap[@]+"${cap[@]}"}) R_LIM+=(${lim[@]+"${lim[@]}"})
+}
+pk_id_match() {         # pk_id_match unix-user:NAME|UID / unix-group:NAME|GID
+    case $1 in
+        unix-user:*)  [[ ${1#unix-user:} == "$M_NAME" || ${1#unix-user:} == "$M_UID" ]] ;;
+        unix-group:*) in_list "${1#unix-group:}" "$M_GROUPS $M_GIDS" ;;
+        *) return 1 ;;
+    esac
+}
+pc_eval_polkit() {
+    local i a root acts
+    local -a al
+    for (( i = 0; i < ${#PK_KIND[@]}; i++ )); do
+        pk_id_match "${PK_ID[i]}" || continue
+        if [[ ${PK_KIND[i]} == PA ]]; then
+            R_CAP+=("polkit admin [${PK_ID[i]}]: pkexec / auth_admin actions with own password  @${PK_SRC[i]}")
+            continue
+        fi
+        root=0
+        IFS=, read -ra al <<<"${PK_ACT[i]}"
+        # Each entry is an action id or a glob ('*', 'org.freedesktop.*'): left
+        # unquoted on purpose so it matches as a pattern.
+        for a in ${al[@]+"${al[@]}"}; do [[ org.freedesktop.policykit.exec == $a ]] && root=1; done
+        acts=${PK_ACT[i]}; [[ $acts == '*' ]] && acts="ALL actions"
+        r="polkit [${PK_ID[i]}]: $acts without admin auth  @${PK_SRC[i]}"
+        if (( root )); then R_CAP+=("$r"); else R_LIM+=("$r"); fi
+    done
+}
+pc_eval_pamcap() {
+    local i w c amb inh root
+    local -a ws caps
+    (( PAMCAP_ACTIVE )) || return
+    for (( i = 0; i < ${#CAP_SPEC[@]}; i++ )); do
+        read -ra ws <<<"${CAP_WHO[i]}"
+        for w in ${ws[@]+"${ws[@]}"}; do
+            [[ $w == '*' || $w == "$M_NAME" ]] && break
+            [[ $w == @* ]] && in_list "${w:1}" "$M_GROUPS" && break
+            w=""
+        done
+        [[ -n ${w-} ]] || continue
+        amb="" inh="" root=0
+        IFS=, read -ra caps <<<"${CAP_SPEC[i],,}"
+        for c in ${caps[@]+"${caps[@]}"}; do
+            case $c in
+                ''|none|'!'*) ;;
+                '^'*) amb+=" ${c:1}"; in_list "${c:1}" "$PC_DANGER_CAPS" && root=1 ;;
+                *)    inh+=" $c" ;;
+            esac
+        done
+        if (( root )); then R_CAP+=("pam_cap ambient:$amb  @${CAP_SRC[i]}")
+        elif [[ -n $amb$inh ]]; then
+            R_LIM+=("pam_cap${amb:+ ambient:$amb}${inh:+ inheritable:$inh} (inheritable caps need a binary with matching file caps)  @${CAP_SRC[i]}")
+        fi
+        return
+    done
+}
+pc_eval_user() {        # pc_eval_user NAME UID
+    local g
+    M_NAME=$1 M_UID=$2 M_ALIAS=U
+    M_GROUPS=$(id -nG "$1" 2>/dev/null); M_GIDS=$(id -G "$1" 2>/dev/null)
+    R_CAP=() R_LIM=()
+    for g in $M_GROUPS; do
+        priv_group_note "$g" || continue
+        if in_list "$g" "$SUDO_GROUPS"; then
+            # Count the name only when sudoers itself can't be read; otherwise the
+            # parsed rules decide whether the group grants anything.
+            (( SUDO_PRESENT )) && [[ -e /etc/sudoers && ! -r /etc/sudoers ]] \
+                && R_CAP+=("group $g ($PG_NOTE; sudoers unreadable, assumed)")
+        elif in_list "$g" "$PRIV_GROUPS_ROOT"; then R_CAP+=("group $g ($PG_NOTE)")
+        else R_LIM+=("group $g ($PG_NOTE)"); fi
+    done
+    (( SUDO_PRESENT )) && pc_eval_sudo
+    (( DOAS_PRESENT )) && pc_eval_doas
+    pc_eval_polkit
+    pc_eval_pamcap
+}
+
+# -- coverage: what was evaluated, and what could not be read --
+pcov="sudoers "
+if (( ! SUDO_PRESENT )); then pcov+="(sudo not installed)"; else pcov+="${#SU_FILES[@]} file(s)/${#SU_CMD[@]} grant(s)"; fi
+if (( ! DOAS_PRESENT )); then pcov+=" | doas not installed"; else pcov+=" | doas ${#DO_ACT[@]} rule(s)"; fi
+pcov+=" | polkit $(( ${#PK_RULES[@]} + ${#PK_LA[@]} )) file(s)/${#PK_KIND[@]} grant(s)"
+if [[ ! -e $CAPCONF ]]; then pcov+=" | pam_cap no capability.conf"
+elif (( PAMCAP_ACTIVE )); then pcov+=" | pam_cap ${#CAP_SPEC[@]} entr(ies)"
+else pcov+=" | pam_cap inactive (pam_cap.so not in /etc/pam.d)"; fi
+dim "privilege sources: $pcov"
+PC_UNREAD=(${SU_UNREAD[@]+"${SU_UNREAD[@]}"} ${PC_UNREAD[@]+"${PC_UNREAD[@]}"})
+if (( ${#PC_UNREAD[@]} )); then
+    pcov=""
+    for (( i = 0; i < ${#PC_UNREAD[@]} && i < 6; i++ )); do pcov+="${pcov:+, }${PC_UNREAD[i]}"; done
+    (( ${#PC_UNREAD[@]} > 6 )) && pcov+=" (+$(( ${#PC_UNREAD[@]} - 6 )) more)"
+    info "NOTE: not readable as ${ME:-this user}, so NOT evaluated: $pcov"
+    if (( SUDO_PRESENT )) && [[ -e /etc/sudoers && ! -r /etc/sudoers ]]; then
+        info "NOTE: sudo rules unknown - sudo/wheel/admin membership is assumed root-capable; re-run as root for full coverage"
+    fi
+fi
+(( ${#DO_FILES[@]} && ! DOAS_PRESENT )) && dim "doas.conf exists but doas is not installed - ignored"
+grep -qsE '^[[:space:]]*sudoers:.*(sss|ldap)' /etc/nsswitch.conf \
+    && info "NOTE: nsswitch.conf also serves sudoers from sss/ldap - those rules are not evaluated"
+for u in ${SU_USERS[@]+"${SU_USERS[@]}"} ${SU_UA[@]+"${SU_UA[@]}"}; do
+    if [[ $PC_US$u == *"$PC_US+"* || $PC_US$u == *"$PC_US%:"* || $PC_US$u == *"$PC_US!+"* || $PC_US$u == *"$PC_US!%:"* ]]; then
+        dim "some sudo rules name netgroups (+x) or non-Unix groups (%:x) - those entries are not evaluated"
+        break
+    fi
+done
+
 if [[ -r /etc/passwd ]]; then
     while IFS=: read -r name _ uid gid _ home shell; do
         [[ $uid =~ ^[0-9]+$ ]] || continue
-        tags=""; flag=0; rogue_uid0=0
+        tags="" regular=0 interactive=0 rogue_uid0=0
+        R_CAP=() R_LIM=()
         if (( uid == 0 )); then
             tags+=" UID0"
             # Any UID 0 account other than 'root' is root-equivalent regardless
             # of its login shell (su target / tampering evidence) - always flag it.
-            [[ $name != root ]] && { flag=1; rogue_uid0=1; }
-        elif (( uid >= UID_MIN && uid <= UID_MAX )); then tags+=" regular"; flag=1
+            [[ $name != root ]] && rogue_uid0=1
+        elif (( uid >= UID_MIN && uid <= UID_MAX )); then tags+=" regular"; regular=1
         else tags+=" system"; fi
-        if is_interactive_shell "$shell"; then tags+=" interactive-shell"; else flag=0; fi
-        if can_elevate "$name"; then tags+=" PRIV-CAPABLE"; flag=1; fi
+        is_interactive_shell "$shell" && { tags+=" interactive-shell"; interactive=1; }
+        # UID 0 already is root; every other account is checked for a path to it.
+        (( uid != 0 )) && pc_eval_user "$name" "$uid"
+        if (( ${#R_CAP[@]} )); then tags+=" PRIV-CAPABLE"; elif (( ${#R_LIM[@]} )); then tags+=" PRIV-LIMITED"; fi
         line="$name  uid=$uid gid=$gid  shell=$shell  home=$home  [${tags# }]"
-        if (( rogue_uid0 )); then hit "$line"
-        elif (( flag )) && is_interactive_shell "$shell"; then hit "$line"
-        elif [[ $tags == *PRIV-CAPABLE* ]]; then hit "$line"
+        if (( rogue_uid0 || ${#R_CAP[@]} )); then hit "$line"
+        elif (( interactive && (regular || ${#R_LIM[@]}) )); then hit "$line"
         else info "$line"; fi
+        for r in ${R_CAP[@]+"${R_CAP[@]}"}; do info "    -> root via $r"; done
+        for r in ${R_LIM[@]+"${R_LIM[@]}"}; do info "    -> limited: $r"; done
     done < /etc/passwd
 else
     hit "/etc/passwd not readable (unusual)"
 fi
-dim "highlighted = a second UID 0 account, a non-standard/human account with a login shell, or an account able to elevate (sudoers/privileged group)"
+dim "highlighted = a second UID 0 account, any PRIV-CAPABLE account, or a human / PRIV-LIMITED account with a login shell"
+dim "PRIV-CAPABLE = a path to root (sudo/doas ALL or GTFOBins command as root, polkit admin, docker/lxd/disk...); PRIV-LIMITED = elevated rights short of root"
 
 # ===========================================================================
 # 3b. SSH LOGIN ACCESS (which local accounts can log in to THIS host, and how)
@@ -682,6 +1292,294 @@ if [[ -d /etc/sudoers.d ]]; then
     for f in /etc/sudoers.d/*; do [[ -e $f ]] && check_perm "$f" 440; done
 fi
 [[ -e /etc/sudo.conf ]] && check_perm /etc/sudo.conf 644
+
+# ===========================================================================
+# 4b. NFS EXPORTS + NETWORK MOUNTS (server exports, root squashing, fstab, live)
+# ===========================================================================
+section "NFS EXPORTS & NETWORK MOUNTS"
+# Network filesystem types checked in /etc/fstab and /proc/self/mounts.
+NETFS_RE='nfs|nfs4|cifs|smb3|smbfs|fuse\.sshfs|sshfs|glusterfs|ceph|fuse\.ceph|davfs'
+declare -A NFS_SEEN=()        # "path|client" -> normalized option state (config vs live drift)
+declare -A NFS_VULN_KEYS=()   # "path|client" already counted as squash-vulnerable
+NFS_VULN_LIST=()
+
+# Parse an NFS export option string into NFS_* globals. Starts from the
+# exports(5) defaults (ro, root_squash, no_all_squash, secure, sec=sys); later
+# options override earlier ones, so "-defaults,client-opts" merges correctly.
+nfs_parse_opts() {
+    local o; local -a ol=()
+    NFS_RSQ=1 NFS_ASQ=0 NFS_RW=0 NFS_SECURE=1 NFS_AUID= NFS_AGID= NFS_SEC=sys
+    IFS=, read -ra ol <<<"$1"
+    for o in ${ol[@]+"${ol[@]}"}; do
+        case $o in
+            root_squash) NFS_RSQ=1 ;;  no_root_squash) NFS_RSQ=0 ;;
+            all_squash)  NFS_ASQ=1 ;;  no_all_squash)  NFS_ASQ=0 ;;
+            rw) NFS_RW=1 ;;            ro) NFS_RW=0 ;;
+            secure) NFS_SECURE=1 ;;    insecure) NFS_SECURE=0 ;;
+            anonuid=*) NFS_AUID=${o#*=} ;;
+            anongid=*) NFS_AGID=${o#*=} ;;
+            sec=*)     NFS_SEC=${o#*=} ;;
+        esac
+    done
+}
+# True when the export accepts AUTH_SYS (client-asserted UIDs). /proc/fs/nfsd
+# shows flavours numerically (1 = sys).
+nfs_sec_sys() { case ":$NFS_SEC:" in *:sys:*|*:1:*|*:none:*|*:null:*) return 0 ;; esac; return 1; }
+nfs_world()   { case $1 in '*'|'<world>'|'0.0.0.0/0'|'0.0.0.0/0.0.0.0'|'::/0') return 0 ;; esac; return 1; }
+# Option state that matters for the checks below, used to spot config/live drift.
+nfs_state() {
+    local a=0 g=0; [[ $NFS_AUID == 0 ]] && a=1; [[ $NFS_AGID == 0 ]] && g=1
+    printf 'rsq=%s asq=%s rw=%s secure=%s anonuid0=%s anongid0=%s' \
+        "$NFS_RSQ" "$NFS_ASQ" "$NFS_RW" "$NFS_SECURE" "$a" "$g"
+}
+
+# nfs_check_squash PATH CLIENT OPTS
+# Flags an export whose root squashing is disabled or defeated:
+#   no_root_squash            -> client root is UID 0 on the share
+#   root_squash + anonuid=0   -> root is "squashed" straight back to root
+#   all_squash  + anonuid=0   -> every client user becomes root
+#   anongid=0 while squashing -> squashed users land in the root group
+# Prints its findings; returns 0 (true) when the export is vulnerable.
+nfs_check_squash() {
+    local who="$1 -> $2" vuln=1
+    nfs_parse_opts "$3"
+    if (( NFS_ASQ )); then
+        if [[ $NFS_AUID == 0 ]]; then
+            hit "$who: all_squash maps EVERY client user to anonuid=0 (root) - squashing gives no protection"; vuln=0
+        else
+            ok "$who: all_squash - every client user mapped to anonuid=${NFS_AUID:-nobody}"
+        fi
+    elif (( ! NFS_RSQ )); then
+        hit "$who: no_root_squash - root squashing DISABLED; client root is UID 0 on this share"
+        (( NFS_RW )) && hit "$who: rw + no_root_squash - client root can create root-owned and setuid files here"
+        vuln=0
+    elif [[ $NFS_AUID == 0 ]]; then
+        hit "$who: root_squash maps client root to anonuid=0 - squashing has no effect"; vuln=0
+    else
+        ok "$who: root_squash in effect (client root -> anonuid=${NFS_AUID:-nobody})"
+        (( NFS_RW )) && nfs_sec_sys && \
+            dim "  note: rw + sec=sys - root_squash protects UID 0 only; all other UIDs/GIDs are client-asserted"
+    fi
+    if (( NFS_ASQ || NFS_RSQ )) && [[ $NFS_AGID == 0 ]]; then
+        hit "$who: anongid=0 - squashed users land in GID 0 (root group)"; vuln=0
+    fi
+    return $vuln
+}
+
+# nfs_check_export SOURCE PATH CLIENT OPTS
+nfs_check_export() {
+    local src=$1 path=$2 client=$3 opts=$4 key="$2|$3"
+    info "$path  ->  $client(${opts:-defaults})   [$src]"
+    nfs_parse_opts "$opts"
+    if nfs_world "$client"; then
+        hit "$path -> $client: exported to ANY host"
+    elif [[ $client == *[*?]* ]]; then
+        dim "  wildcard client pattern: $client"
+    fi
+    (( NFS_SECURE )) || hit "$path -> $client: insecure - accepts requests from unprivileged (>1023) source ports"
+    case $path in
+        /|/etc|/etc/*|/root|/root/*|/boot|/boot/*|/usr|/var|/bin|/sbin|/lib|/lib64)
+            if (( NFS_RW )); then hit "$path -> $client: sensitive system path exported read-write"
+            else dim "  sensitive system path exported (read-only)"; fi ;;
+    esac
+    NFS_SEEN[$key]=$(nfs_state)
+    if nfs_check_squash "$path" "$client" "$opts"; then
+        if [[ -z ${NFS_VULN_KEYS[$key]+x} ]]; then
+            NFS_VULN_KEYS[$key]=1
+            NFS_VULN_LIST+=("$path -> $client  [$src]")
+        fi
+    fi
+}
+
+# One logical /etc/exports entry: PATH [-defaults] client[(opts)] ...
+nfs_parse_export_line() {
+    local src=$1 entry=$2 path rest t client copts defs="" n=0
+    local -a toks=()
+    entry=${entry#"${entry%%[![:space:]]*}"}                       # left-trim
+    if [[ $entry == \"* ]]; then                                    # "quoted path with spaces"
+        path=${entry#\"}; path=${path%%\"*}; rest=${entry#\"*\"}
+    else
+        path=${entry%%[[:space:]]*}; rest=${entry#"$path"}
+    fi
+    read -ra toks <<<"$rest"
+    for t in ${toks[@]+"${toks[@]}"}; do
+        if [[ $t == -* ]]; then defs+=${defs:+,}${t#-}; continue; fi   # default opts for later clients
+        if [[ $t == \(* ]]; then
+            # "path host (rw)": the space detaches the options from the host,
+            # so they apply to every host while "host" gets the defaults.
+            client='*'; copts=${t#\(}; copts=${copts%\)}
+            hit "$src: '$path ... ($copts)' has options with no host (space before '(') -> they apply to EVERY host"
+        elif [[ $t == *\(* ]]; then
+            client=${t%%\(*}; copts=${t#*\(}; copts=${copts%\)}
+        else
+            client=$t; copts=""
+        fi
+        ((n++))
+        nfs_check_export "$src" "$path" "$client" "${defs}${defs:+${copts:+,}}${copts}"
+    done
+    if (( n == 0 )); then
+        hit "$src: $path has no client list -> exported to EVERY host with default options"
+        nfs_check_export "$src" "$path" '*' "$defs"
+    fi
+}
+
+# Read an exports(5) file: strip comments, join "\" continuations.
+nfs_parse_exports_file() {
+    local f=$1 line buf="" ln=0 start=0 entries=0
+    while IFS= read -r line || [[ -n $line ]]; do
+        ((ln++))
+        [[ -z $buf ]] && start=$ln
+        line=${line%%#*}
+        if [[ $line == *\\ ]]; then buf+="${line%\\} "; continue; fi
+        buf+=$line
+        [[ $buf =~ ^[[:space:]]*$ ]] && { buf=""; continue; }
+        ((entries++))
+        nfs_parse_export_line "$f:$start" "$buf"
+        buf=""
+    done < "$f"
+    (( entries )) || dim "no active entries in $f"
+}
+
+# nfs_check_mount SOURCE SPEC MOUNTPOINT FSTYPE OPTS  (client-side mount hygiene)
+nfs_check_mount() {
+    local src=$1 spec=$2 mp=$3 fstype=$4 opts=$5 o cf nosuid=0 nodev=0
+    local -a ol=()
+    info "$spec on $mp type $fstype ($opts)   [$src]"
+    IFS=, read -ra ol <<<"$opts"
+    for o in ${ol[@]+"${ol[@]}"}; do
+        case $o in
+            nosuid) nosuid=1 ;;  suid) nosuid=0 ;;
+            nodev)  nodev=1 ;;   dev)  nodev=0 ;;
+            user|users|owner)    # imply nosuid,nodev unless overridden later
+                nosuid=1; nodev=1
+                dim "  '$o': non-root users may mount/unmount this filesystem" ;;
+            credentials=*|cred=*|IdentityFile=*)
+                cf=${o#*=}
+                if [[ -r $cf ]]; then hit "$mp: credential file $cf is READABLE by me"
+                elif [[ -e $cf ]]; then dim "  credential file $cf (exists, not readable by me)"
+                else dim "  credential file $cf (not found)"; fi ;;
+            password=*|pass=*|password2=*)
+                hit "$mp: inline credential in $src: $o" ;;
+        esac
+    done
+    (( nosuid )) || hit "$mp: mounted without nosuid - setuid files on the remote share are honoured on this host"
+    (( nodev ))  || dim "  $mp: no nodev - device files on the share are honoured"
+}
+
+sub "NFS server status"
+nfs_srv=0
+ps -e -o comm= 2>/dev/null | grep -qx nfsd && nfs_srv=1
+if have systemctl; then
+    for u in nfs-server nfs-kernel-server; do
+        systemctl is-active --quiet "$u" 2>/dev/null && nfs_srv=1
+    done
+fi
+if (( nfs_srv )); then info "NFS server is RUNNING on this host"
+else info "NFS server not running (exports below are configured but not currently served)"; fi
+
+sub "/etc/exports"
+check_perm /etc/exports 644
+[[ -e /etc/exports && -w /etc/exports ]] && hit "/etc/exports is WRITABLE by me -> can add an export"
+if [[ -r /etc/exports ]]; then
+    nfs_parse_exports_file /etc/exports
+elif [[ -e /etc/exports ]]; then
+    dim "not readable"
+fi
+
+if [[ -d /etc/exports.d ]]; then
+    sub "/etc/exports.d/*.exports"
+    [[ -w /etc/exports.d ]] && hit "/etc/exports.d is WRITABLE by me -> can drop in an export"
+    nfs_dropins=0
+    for f in /etc/exports.d/*.exports; do
+        [[ -e $f ]] || continue
+        ((nfs_dropins++))
+        check_perm "$f" 644
+        [[ -w $f ]] && hit "$f is WRITABLE by me"
+        if [[ -r $f ]]; then nfs_parse_exports_file "$f"; else dim "not readable"; fi
+    done
+    (( nfs_dropins )) || dim "no *.exports files"
+fi
+
+sub "active export table (what is being served now)"
+nfs_live="" nfs_live_src=""
+for f in /var/lib/nfs/etab /proc/fs/nfsd/exports; do
+    [[ -r $f ]] || continue
+    nfs_live=$(grep -vE '^[[:space:]]*(#|$)' "$f" 2>/dev/null)   # /proc files report size 0; read, don't -s
+    [[ -n $nfs_live ]] && { nfs_live_src=$f; break; }
+done
+if [[ -n $nfs_live ]]; then
+    dim "source: $nfs_live_src (effective options, defaults expanded)"
+    while IFS= read -r l; do
+        l_path=${l%%[[:space:]]*}
+        read -ra l_toks <<<"${l#"$l_path"}"
+        for t in ${l_toks[@]+"${l_toks[@]}"}; do
+            [[ $t == *\(* ]] || continue
+            l_client=${t%%\(*}; l_opts=${t#*\(}; l_opts=${l_opts%\)}
+            [[ -z $l_client ]] && l_client='*'
+            l_key="$l_path|$l_client"
+            nfs_parse_opts "$l_opts"; l_state=$(nfs_state)
+            if [[ -z ${NFS_SEEN[$l_key]+x} ]]; then
+                hit "$l_path -> $l_client: served but not in the config files (added at runtime via exportfs?)"
+                nfs_check_export "$nfs_live_src" "$l_path" "$l_client" "$l_opts"
+            elif [[ ${NFS_SEEN[$l_key]} != "$l_state" ]]; then
+                hit "$l_path -> $l_client: live options differ from config (edited without 'exportfs -ra'?)"
+                nfs_check_export "$nfs_live_src" "$l_path" "$l_client" "$l_opts"
+            else
+                ok "$l_path -> $l_client: live options match config (findings above apply)"
+            fi
+        done
+    done <<<"$nfs_live"
+else
+    dim "nothing exported (empty or unreadable /var/lib/nfs/etab and /proc/fs/nfsd/exports)"
+fi
+
+if have showmount; then
+    sub "showmount -e localhost (loopback query to the local mountd)"
+    if have timeout; then o=$(timeout 5 showmount -e localhost 2>/dev/null)
+    else o=$(showmount -e localhost 2>/dev/null); fi
+    [[ -n $o ]] && printf '%s\n' "$o" | cap | indent || dim "no answer (mountd not running, NFSv4-only server, or filtered)"
+else
+    missing showmount
+fi
+
+sub "root-squash summary"
+if (( ${#NFS_VULN_LIST[@]} )); then
+    hit "${#NFS_VULN_LIST[@]} export(s) with root squashing disabled or defeated:"
+    printf '%s\n' "${NFS_VULN_LIST[@]}" | sed 's/^/        /'
+else
+    ok "no exports with root squashing disabled or defeated"
+fi
+
+sub "/etc/fstab - network filesystems (this host as client)"
+check_perm /etc/fstab 644
+[[ -w /etc/fstab ]] && hit "/etc/fstab is WRITABLE by me -> can add mounts (e.g. without nosuid)"
+if [[ -r /etc/fstab ]]; then
+    nfs_fs=0
+    while read -r spec mp fstype mopts _; do
+        [[ -z ${spec:-} || $spec == \#* ]] && continue
+        [[ $fstype =~ ^($NETFS_RE)$ || ( $fstype == fuse && $spec == sshfs\#* ) ]] || continue
+        ((nfs_fs++))
+        nfs_check_mount /etc/fstab "$spec" "$mp" "$fstype" "${mopts:-defaults}"
+    done < /etc/fstab
+    (( nfs_fs )) || dim "no network filesystems in /etc/fstab"
+else
+    dim "not readable"
+fi
+
+sub "network filesystems mounted now (/proc/self/mounts)"
+if [[ -r /proc/self/mounts ]]; then
+    nfs_mnt=0
+    while read -r spec mp fstype mopts _; do
+        [[ $fstype =~ ^($NETFS_RE)$ || ( $fstype == fuse && $spec == sshfs\#* ) ]] || continue
+        ((nfs_mnt++))
+        nfs_check_mount /proc/mounts "$spec" "$mp" "$fstype" "$mopts"
+        mpd=$(printf '%b' "$mp")                     # decode \040-style escapes
+        [[ -w $mpd ]] && dim "  mount point $mpd is WRITABLE by me"
+    done < /proc/self/mounts
+    (( nfs_mnt )) || dim "no network filesystems currently mounted"
+else
+    dim "/proc/self/mounts not readable"
+fi
 
 # ===========================================================================
 # 5. SUDO-ABUSABLE BINARIES (GTFOBins) from sudo -l

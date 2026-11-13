@@ -7,22 +7,31 @@
 # on what happens at stdin EOF, so this script sticks to what they share:
 #   * -n and -w are common to all of them.
 #   * The connect test uses -z, or --send-only on old ncat (RHEL 7) without -z.
-#   * Banner reads keep stdin open and rely on timeout(1) to end the session,
-#     because -w means "idle timeout" on some flavours and "connect timeout"
-#     on others.
+#   * Banner reads send the payload and then close stdin. Every flavour keeps
+#     reading after that (ncat only with --no-shutdown, which is used when it
+#     is available). timeout(1) ends every read, because -w means "idle
+#     timeout" on some flavours and "connect timeout" on others.
 #
 # Requires bash 4.0+, coreutils, awk, xargs and getent. A static `nc` binary
 # placed in the directory the script is called from is preferred over any nc on
 # PATH (handy on locked-down targets with no netcat, or an incompatible libc).
 # If no netcat is found at all, it falls back to bash's built-in /dev/tcp.
 #
-# UDP (-u) does not use nc. Each probe uses a connected socket from bash's
+# UDP (-sU) does not use nc. Each probe uses a connected socket from bash's
 # /dev/udp, sends the request with dd and reads one reply with dd. A connected
 # socket turns an ICMP port-unreachable into ECONNREFUSED on the next send or
 # receive, so closed ports can be told apart from silent ones. The nc flavours
 # report that ICMP differently (or not at all), so going through nc would lose it.
 # Ports whose services only answer a well-formed request get one (see
 # udp_payloads); every other port gets a short generic datagram.
+
+# Runs before anything bash-4-specific, and is plain POSIX sh so the message
+# still comes out under sh or an old bash. Every helper process (xargs workers,
+# the /dev/tcp and /dev/udp probes) is started as "$BASH", this same bash.
+if [ -z "${BASH_VERSION:-}" ] || [ "${BASH_VERSINFO:-0}" -lt 4 ]; then
+    echo "${0##*/}: requires bash 4.0 or newer (running: ${BASH_VERSION:-not bash})" >&2
+    exit 2
+fi
 
 PROG=${0##*/}
 # Directory the script was invoked from. A static nc dropped here is preferred
@@ -33,7 +42,8 @@ JOBS=50             # concurrent probes
 MAX_HOSTS=65536     # largest target list accepted (a /16)
 BANNER_MAX=120      # banner characters shown
 HTTP_PROBE='HEAD / HTTP/1.0\r\n\r\n'
-PROTO=tcp           # tcp, or udp with -u
+PROTO=tcp           # tcp, or udp with -sU (passed to getopts as -u)
+SHOW_REASON=0       # 1 with --reason (passed to getopts as -r)
 UDP_LIST_MAX=25     # per host, list at most this many open|filtered (or filtered)
                     # UDP ports individually; above it they are only counted
 
@@ -46,7 +56,7 @@ targets=()
 
 usage() {
     cat <<EOF
-Usage: $PROG -p <port[s]> [-u] [-t seconds] [-j jobs] <target> [target...]
+Usage: $PROG -p <port[s]> [-sU] [--reason] [-t seconds] [-j jobs] <target> [target...]
 
 Ports (-p):
   22                  single port
@@ -64,7 +74,9 @@ Targets:
   10.0.0.1,10.0.0.9,host.lan    comma-separated mix of the above
 
 Options:
-  -u            scan UDP instead of TCP
+  -sU           scan UDP instead of TCP
+  --reason      show why each port is in its state (as nmap --reason does):
+                a REASON column, and the reasons behind ports not shown
   -t seconds    connect and banner timeout; for UDP, how long to wait for a
                 reply (default: $TIMEOUT)
   -j jobs       concurrent probes (default: $JOBS)
@@ -73,12 +85,18 @@ Options:
 While scanning, a progress line (probes done, open so far, elapsed, time
 left) is shown on stderr when stderr is a terminal.
 
-UDP states (-u):
+UDP states (-sU):
   open            the port sent a reply
   open|filtered   no reply: the port may be open but ignored the probe, or
                   a firewall dropped it
-  filtered        an ICMP error other than port-unreachable came back
+  filtered        the kernel reported an ICMP error on the socket other than
+                  port-unreachable: admin-prohibited (codes 9, 10, 13, e.g.
+                  firewalld's default REJECT) or protocol-unreachable. Plain
+                  host/net-unreachable (codes 0, 1) are not reported for UDP
+                  on Linux, so those ports show as open|filtered.
   closed          ICMP port-unreachable came back (not listed, only counted)
+  Probes this machine could not send (no route, a broadcast address, a local
+  firewall) are not a port state: they are counted as local errors.
   Linux sends a scanner only about one port-unreachable per second after a
   short burst, and other systems rate-limit them too. On a large UDP scan many
   closed ports therefore show as open|filtered. For accurate closed vs
@@ -87,7 +105,7 @@ UDP states (-u):
 Examples:
   $PROG -p 22,80,443 192.168.1.10
   $PROG -p 1-1024 -t 1 -j 100 192.168.1.0/24 web01.lan
-  $PROG -u -p 53,123,161,500,1900 192.168.1.0/24
+  $PROG -sU -p 53,123,161,500,1900 192.168.1.0/24
 EOF
 }
 
@@ -386,10 +404,14 @@ add_octets() {
 # absent or empty): getent, then python3, host, dig.
 resolve_ipv4() {
     local name=$1 ip=
+    # 'getent hosts' may answer with IPv6 only (glibc asks for IPv6 first), so
+    # every step keeps IPv4 results only; an IPv6 answer must not stop the
+    # fallbacks below from running.
+    local first_v4='$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print $1; exit }'
 
     if have getent; then
-        ip=$(getent ahostsv4 "$name" 2>/dev/null | awk 'NR == 1 { print $1 }')
-        [[ -n $ip ]] || ip=$(getent hosts "$name" 2>/dev/null | awk 'NR == 1 { print $1 }')
+        ip=$(getent ahostsv4 "$name" 2>/dev/null | awk "$first_v4")
+        [[ -n $ip ]] || ip=$(getent hosts "$name" 2>/dev/null | awk "$first_v4")
     fi
     [[ -z $ip ]] && have python3 && ip=$(python3 -c \
         'import socket,sys
@@ -440,11 +462,13 @@ add_target() {
 }
 
 find_nc() {
-    # Prefer a static nc shipped alongside the script (absolute path, so the
-    # xargs worker shells resolve it regardless of their own working directory).
+    # Prefer a static nc in the directory the script was called from ($CALLDIR,
+    # an absolute path, so the xargs worker shells resolve it wherever they run).
     # Typical use: a netcat 1.10 build from github.com/H74N/netcat-binaries
-    # dropped in beside portscan.sh and renamed to 'nc'.
-    local local_nc="$CALLDIR/nc" probe
+    # dropped in the working directory and renamed to 'nc'. Note that whatever
+    # 'nc' is there gets executed, so don't run this from a shared directory
+    # such as /tmp.
+    local local_nc="$CALLDIR/nc" probe help
     if [[ -x $local_nc ]]; then
         # Confirm it actually executes as netcat. A wrong-arch binary (the repo
         # ships both nc32 and nc64) keeps its +x bit but fails to exec, which
@@ -467,26 +491,118 @@ find_nc() {
             "(install with: apt-get install netcat-openbsd, or dnf install nmap-ncat)"
         return 0
     fi
-    # netcat 1.10 and OpenBSD nc advertise -z (zero-I/O scan); old ncat (RHEL 7)
-    # does not, so use --send-only there instead.
-    if [[ -n $probe ]] && [[ $NC == "$local_nc" ]]; then
-        grep -q -- '-z' <<<"$probe" && NC_CONNECT_FLAG=-z || NC_CONNECT_FLAG=--send-only
-    elif "$NC" -h </dev/null 2>&1 | grep -q -- '-z'; then
-        NC_CONNECT_FLAG=-z
+    # netcat 1.10, OpenBSD nc and ncat 7+ advertise -z (zero-I/O scan); old
+    # ncat (RHEL 7) has --send-only instead. A netcat with neither (e.g. a
+    # minimal BusyBox build) would fail every probe and report every port
+    # closed, so it is not used.
+    if [[ $NC == "$local_nc" ]]; then
+        help=$probe
     else
+        help=$("$NC" -h </dev/null 2>&1)
+    fi
+    if grep -q -- '-z' <<<"$help"; then
+        NC_CONNECT_FLAG=-z
+    elif grep -q -- '--send-only' <<<"$help"; then
         NC_CONNECT_FLAG=--send-only
+    else
+        warn "$NC offers neither -z nor --send-only; falling back to bash /dev/tcp"
+        NC= NC_CONNECT_FLAG=
+        return 0
+    fi
+    # Help text can mislead, so confirm this netcat takes the flags as used.
+    if ! nc_flags_work -v "$NC_CONNECT_FLAG"; then
+        warn "$NC rejected '-v $NC_CONNECT_FLAG -n -w'; falling back to bash /dev/tcp"
+        NC= NC_CONNECT_FLAG=
+        return 0
+    fi
+    # Banner reads close stdin once the payload is sent. ncat answers that by
+    # half-closing the socket (FIN), and a server that holds back its greeting
+    # may hang up on it. --no-shutdown (newer ncat) keeps the connection fully
+    # open, as the other flavours do by default.
+    if grep -q -- '--no-shutdown' <<<"$help" && nc_flags_work --no-shutdown; then
+        NC_READ_FLAG=--no-shutdown
     fi
 }
 
+# True if "$NC <flags> -n -w" runs as a connection. Aimed at a local port it
+# must succeed or fail as a connection (open, refused or timed out, all fine),
+# not with a usage error, unknown option or failure to execute.
+nc_flags_work() {
+    local out status
+
+    # C locale: the patterns below are English, and getopt translates them.
+    out=$(LC_ALL=C timeout 3 "$NC" "$@" -n -w 1 127.0.0.1 9 </dev/null 2>&1)
+    status=$?
+    ((status < 124)) &&
+        ! grep -qiE 'usage|invalid option|unrecognized option|unknown option|illegal option' <<<"$out"
+}
+
+# Test whether ip:port accepts a TCP connection; the status says so. Prints
+# what nc (-v, which every flavour has) or bash said about the attempt, such as
+# "Connection refused" or "timed out", for port_reason to read. The C locale
+# keeps that text in English: nc and bash print strerror(), which glibc
+# translates under a non-English LANG.
 port_is_open() {
     local ip=$1 port=$2
 
     if [[ -n $NC ]]; then
-        timeout "$((TIMEOUT + 1))" "$NC" "$NC_CONNECT_FLAG" -n -w "$TIMEOUT" \
-            "$ip" "$port" </dev/null >/dev/null 2>&1
+        LC_ALL=C timeout "$((TIMEOUT + 1))" "$NC" -v "$NC_CONNECT_FLAG" -n -w "$TIMEOUT" \
+            "$ip" "$port" </dev/null 2>&1
     else
-        timeout "$TIMEOUT" bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$ip" "$port" 2>/dev/null
+        LC_ALL=C timeout "$TIMEOUT" "$BASH" -c 'exec 3<>"/dev/tcp/$0/$1"' "$ip" "$port" 2>&1
     fi
+}
+
+# Why a port is in its state, as one token in the style of nmap --reason.
+# Call as `port_reason <tcp|udp> <state> <exit status> [error text]`, where the
+# error text is what nc, bash or dd reported for the probe. Prints one of:
+#   syn-ack           TCP connection completed
+#   conn-refused      TCP connection refused: a RST, or ICMP port unreachable
+#   reset             TCP connection reset while connecting (not seen on
+#                     Linux, where a RST during connect reads as refused)
+#   udp-response      UDP reply received
+#   port-unreach      ICMP port unreachable
+#   admin-prohibited  ICMP administratively prohibited (UDP; see below)
+#   host-unreach      ICMP host unreachable; over TCP also host-prohibited
+#                     (e.g. firewalld's default REJECT), so not proof the
+#                     host is down
+#   net-unreach       network unreachable or prohibited
+#   proto-unreach     ICMP protocol unreachable
+#   no-response       nothing came back before the timeout
+#   local-error       this machine could not send the probe
+#   unknown           anything else
+# The kernel only passes an errno, not the ICMP code, so codes sharing an errno
+# share a token. A Linux TCP connect aborts on any ICMP unreachable, so code 1
+# (host unreachable) and codes 10/13 (prohibited) all arrive as EHOSTUNREACH.
+# A connected Linux UDP socket never reports code 1, so there EHOSTUNREACH can
+# only mean codes 10, 13, 14 or 15: hence admin-prohibited.
+port_reason() {
+    local proto=$1 state=$2 status=$3 text=${4,,}
+
+    case $proto:$state in
+        tcp:open)            echo syn-ack;      return ;;
+        udp:open)            echo udp-response; return ;;
+        udp:closed)          echo port-unreach; return ;;
+        'udp:open|filtered') echo no-response;  return ;;
+        udp:error)           echo local-error;  return ;;
+    esac
+    # tcp:closed and udp:filtered: what was reported decides.
+    if ((status == 124)); then
+        echo no-response
+        return
+    fi
+    case $text in
+        *refused*)                               echo conn-refused ;;
+        *reset*)                                 echo reset ;;
+        *'timed out'*|*timeout*)                 echo no-response ;;
+        *'no route to host'*)
+            [[ $proto == udp ]] && echo admin-prohibited || echo host-unreach ;;
+        *'host is down'*|*'not on the network'*) echo host-unreach ;;
+        *'network is unreachable'*)              echo net-unreach ;;
+        *'protocol not available'*)              echo proto-unreach ;;
+        *'permission denied'*|*'not permitted'*) echo local-error ;;
+        *)                                       echo unknown ;;
+    esac
 }
 
 # Connect, optionally send a payload, and print what the service returns.
@@ -495,14 +611,15 @@ port_is_open() {
 read_service() {
     local ip=$1 port=$2 payload=$3 read_to=${4:-$TIMEOUT}
 
-    # -w keeps the connection readable for the final net reads after our payload
-    # EOFs, so no background 'sleep' is needed to hold the socket open (that only
-    # left a process lingering until the timeout elapsed).
+    # stdin hits EOF right after the payload. nc keeps reading the socket after
+    # that (ncat thanks to $NC_READ_FLAG), so no background 'sleep' is needed to
+    # hold stdin open; that only left a process lingering until the timeout.
+    # timeout(1) ends the read whether or not the service closes first.
     if [[ -n $NC ]]; then
-        timeout "$read_to" "$NC" -n -w "$read_to" "$ip" "$port" \
+        timeout "$read_to" "$NC" ${NC_READ_FLAG:+"$NC_READ_FLAG"} -n -w "$read_to" "$ip" "$port" \
             < <(printf '%b' "$payload" | cat) 2>/dev/null
     else
-        timeout "$read_to" bash -c \
+        timeout "$read_to" "$BASH" -c \
             'exec 3<>"/dev/tcp/$0/$1"; printf "%b" "$2" | cat >&3; cat <&3' \
             "$ip" "$port" "$payload" 2>/dev/null
     fi
@@ -524,14 +641,18 @@ clean_banner() {
         }'
 }
 
-# Probe one TCP port and print "index<TAB>port<TAB>state<TAB>banner", where
-# state is open or closed. Every probe prints exactly one line, which is what
-# track_progress counts.
+# Probe one TCP port and print "index<TAB>port<TAB>state<TAB>reason<TAB>banner",
+# where state is open or closed and reason comes from port_reason (never
+# empty, so tab-splitting cannot shift the fields). Every probe prints exactly
+# one line, which is what track_progress counts.
 scan_port() {
-    local index=$1 ip=$2 port=$3 banner greet_to
+    local index=$1 ip=$2 port=$3 banner greet_to said status
 
-    if ! port_is_open "$ip" "$port"; then
-        printf '%s\t%s\tclosed\t\n' "$index" "$port"
+    said=$(port_is_open "$ip" "$port")
+    status=$?
+    if ((status != 0)); then
+        printf '%s\t%s\tclosed\t%s\t\n' "$index" "$port" \
+            "$(port_reason tcp closed "$status" "$said")"
         return 0
     fi
 
@@ -544,7 +665,7 @@ scan_port() {
     banner=$(read_service "$ip" "$port" '' "$greet_to" | clean_banner)
     [[ -n $banner ]] || banner=$(read_service "$ip" "$port" "$HTTP_PROBE" | clean_banner)
 
-    printf '%s\t%s\t%s\t%s\n' "$index" "$port" open "$banner"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$index" "$port" open "$(port_reason tcp open 0)" "$banner"
 }
 
 # Request datagrams for UDP services that stay silent unless asked something
@@ -591,18 +712,23 @@ udp_payloads() {
     esac
 }
 
-# Exit from udp_exchange based on an error dd reported (its first line ends in
-# strerror). The C locale is forced on dd so the text is in English.
+# Exit from udp_exchange based on an error message from dd or bash (its first
+# line ends in strerror; the C locale is forced so the text is in English).
+# Call as `udp_error <message> [status]`: port unreachable always exits 3;
+# anything else prints the reason and exits with status (default 4).
 udp_error() {
-    local reason=${1%%$'\n'*}
+    local reason=${1%%$'\n'*} status=${2:-4}
 
     reason=${reason##*: }
     case $reason in
         # ECONNREFUSED (Linux) / ECONNRESET (Cygwin): ICMP port unreachable.
         *[Rr]efused*|*[Rr]eset*) exit 3 ;;
+        # EPERM / EACCES come from this machine (an OUTPUT firewall rule, a
+        # broadcast address), never from an ICMP reply.
+        *'not permitted'*|*'Permission denied'*) status=5 ;;
     esac
-    printf '%s\n' "$reason"
-    exit 4
+    printf '%s\n' "${reason:-unknown error}"
+    exit "$status"
 }
 
 # One UDP exchange: send each payload argument as its own datagram, then wait up
@@ -610,18 +736,27 @@ udp_error() {
 # element) since it opens fd 3 and exits. Exit status:
 #   0    reply received (raw bytes on stdout)
 #   3    ICMP port unreachable (closed)
-#   4    other ICMP unreachable or a local send error (reason on stdout)
+#   4    another ICMP error reported on the socket (reason on stdout)
+#   5    local error: no probe left this machine (reason on stdout)
 #   124  no reply within the timeout
 udp_exchange() {
-    local ip=$1 port=$2 payload err status
+    local ip=$1 port=$2 payload err status send_fail=5
     shift 2
 
-    { exec 3<>"/dev/udp/$ip/$port"; } 2>/dev/null || { echo 'could not open socket'; exit 4; }
+    # Opening the socket only binds and connects it; nothing is sent. A failure
+    # here is local (no route, a broadcast address) and says nothing about the
+    # target. Repeat the open in a subshell to capture bash's message.
+    if ! { exec 3<>"/dev/udp/$ip/$port"; } 2>/dev/null; then
+        udp_error "$(LC_ALL=C; { exec 3<>"/dev/udp/$ip/$port"; } 2>&1)" 5
+    fi
     for payload; do
         # printf flushes at every newline. dd with differing ibs/obs gathers
         # those pieces into one write, so each payload goes out as one datagram.
+        # Before the first datagram is out no ICMP reply can exist, so an error
+        # on it is local; on later ones it may be an ICMP error from the first.
         err=$(printf '%b' "$payload" | LC_ALL=C dd ibs=4096 obs=65536 2>&1 >&3) ||
-            udp_error "$err"
+            udp_error "$err" "$send_fail"
+        send_fail=4
     done
     # A single read() (count=1) on a datagram socket returns exactly one reply.
     # timeout wraps dd itself, the only step that can block, so the signal goes
@@ -679,9 +814,10 @@ udp_banner() {
         }'
 }
 
-# Probe one UDP port and print "index<TAB>port<TAB>state<TAB>banner", where
-# state is open, open|filtered, filtered or closed (exactly one line per probe,
-# as with scan_port).
+# Probe one UDP port and print "index<TAB>port<TAB>state<TAB>reason<TAB>banner",
+# where state is open, open|filtered, filtered or closed, or error when the
+# probe could not be sent and the banner holds the reason (exactly one line per
+# probe, as with scan_port).
 scan_port_udp() {
     local index=$1 ip=$2 port=$3 bytes status state banner=
     local -a payloads
@@ -695,12 +831,16 @@ scan_port_udp() {
         0)   state=open ;;
         3)   state=closed ;;
         4)   state=filtered ;;
+        5)   state=error ;;
         124) state='open|filtered' ;;
-        *)   state=filtered; bytes= ;;
+        *)   state=error; bytes= ;;     # dd or timeout itself failed
     esac
     [[ $state == open || -n $bytes ]] && banner=$(udp_banner <<<"$bytes")
+    [[ $state == error && -z $banner ]] && banner="probe failed (exit status $status)"
 
-    printf '%s\t%s\t%s\t%s\n' "$index" "$port" "$state" "$banner"
+    # For filtered ports the banner is the error text that names the ICMP error.
+    printf '%s\t%s\t%s\t%s\t%s\n' "$index" "$port" "$state" \
+        "$(port_reason udp "$state" "$status" "$banner")" "$banner"
 }
 
 list_probes() {
@@ -732,14 +872,23 @@ fmt_duration() {
 # report that follows prints on a clean line.
 track_progress() {
     local total=$1 finished=0 open=0 start=$SECONDS last=-1
-    local line rest state elapsed eta_text elapsed_text
+    local line rest state reason key elapsed eta_text elapsed_text
+    local -A closed_why=()   # "host index<TAB>reason" -> closed ports
 
     ((SHOW_PROGRESS)) && trap 'printf "\r\033[K" >&2; exit 130' INT TERM
     while IFS= read -r line; do
         ((finished += 1))
         rest=${line#*$'\t'}; rest=${rest#*$'\t'}; state=${rest%%$'\t'*}
         [[ $state == open ]] && ((open += 1))
-        [[ $state == closed ]] || printf '%s\n' "$line"
+        if [[ $state != closed ]]; then
+            printf '%s\n' "$line"
+        elif ((SHOW_REASON)); then
+            # Closed rows are dropped, but --reason reports why they were
+            # closed, so keep a count per host and reason.
+            reason=${rest#*$'\t'}; reason=${reason%%$'\t'*}
+            key=${line%%$'\t'*}$'\t'$reason
+            closed_why[$key]=$(( ${closed_why[$key]:-0} + 1 ))
+        fi
 
         ((SHOW_PROGRESS)) || continue
         ((SECONDS != last || finished == total)) || continue
@@ -759,32 +908,76 @@ track_progress() {
             "$open" "$elapsed_text" "$eta_text" >&2
     done
     ((SHOW_PROGRESS)) && printf '\r\033[K' >&2
+    # One "closed-why" row per host and reason: "index 0 closed-why reason count".
+    # Port 0 sorts them ahead of the host's own rows.
+    for key in "${!closed_why[@]}"; do
+        printf '%s\t0\tclosed-why\t%s\t%s\n' \
+            "${key%%$'\t'*}" "${key#*$'\t'}" "${closed_why[$key]}"
+    done
+    # Workers stopped early (xargs gives up if one is killed). print_report
+    # reads missing rows as closed ports, so pass it a marker row; host index
+    # -1 sorts first.
+    ((finished == total)) || printf -- '-1\t0\tincomplete\t-\t%s\n' "$finished"
     return 0
 }
 
 # Print one host's block. Arguments after the host index are its result rows,
-# "port<TAB>state<TAB>banner". track_progress has already dropped closed rows,
-# so the closed count is the number of ports scanned minus the number of rows.
+# "port<TAB>state<TAB>reason<TAB>banner". track_progress has already dropped
+# closed rows, so the closed count is the number of ports scanned minus the
+# number of rows, and a host with no rows at all had no port answer. With
+# --reason, $host_why (set by print_report) says why its closed ports were
+# closed, e.g. "998 conn-refused, 2 no-response".
 report_host() {
-    local index=$1 row port state banner svc closed joined
-    local n_open=0 n_of=0 n_filt=0 width=7
+    local index=$1 row port state reason banner svc closed joined err_reason=
+    local n_open=0 n_of=0 n_filt=0 n_err=0 width=7 why=
     local -a notes=()
     shift
+    ((SHOW_REASON)) && [[ -n $host_why ]] && why=" ($host_why)"
 
     for row; do
         case $row in
             *$'\t'open$'\t'*)            ((n_open += 1)) ;;
             *$'\t''open|filtered'$'\t'*) ((n_of += 1)) ;;
+            *$'\t'error$'\t'*)           ((n_err += 1))
+                                         [[ -n $err_reason ]] || err_reason=${row##*$'\t'} ;;
             *)                           ((n_filt += 1)) ;;
         esac
     done
     closed=$((port_count - $#))
 
+    if (($# == 0)); then
+        # Over UDP every port answered with ICMP port-unreachable, so the host
+        # is up: give it a one-line block. Over TCP no open port cannot be told
+        # apart from filtered ports or a host that is down, so only count it.
+        if [[ $PROTO == udp ]]; then
+            ((hosts_reported++)) && echo
+            printf 'Scan report for %s\n' "${host_labels[index]}"
+            printf 'All %d scanned UDP port(s) are closed (ICMP port unreachable)\n' "$port_count"
+        elif [[ $host_why == *conn-refused* ]]; then
+            # --reason knows more: a refused connection means the host sent a
+            # RST, so it is up even though no port is open.
+            ((hosts_reported++)) && echo
+            printf 'Scan report for %s\n' "${host_labels[index]}"
+            printf 'All %d scanned TCP port(s) are closed%s\n' "$port_count" "$why"
+        else
+            ((no_open_hosts += 1))
+        fi
+        return 0
+    fi
+
+    # No probe left this machine (no route, a broadcast address, a local
+    # firewall), so nothing is known about the target. Collect it for a warning
+    # instead of listing ports whose state was never tested.
+    if ((n_err == port_count)); then
+        unsent_hosts[$err_reason]+=" ${host_ips[index]}"
+        return 0
+    fi
+
     if [[ $PROTO == udp ]]; then
         width=15
         # No reply of any kind (not even ICMP) can also mean the host is down.
         # Count such hosts instead of printing a block of open|filtered ports.
-        if ((n_open + n_filt + closed == 0)); then
+        if ((n_open + n_filt + n_err + closed == 0)); then
             ((silent_hosts += 1, openfilt_count += n_of))
             return 0
         fi
@@ -792,22 +985,35 @@ report_host() {
 
     ((hosts_reported++)) && echo
     printf 'Scan report for %s\n' "${host_labels[index]}"
-    printf '%-12s%-*s%-20s%s\n' PORT "$width" STATE SERVICE BANNER
+    if ((SHOW_REASON)); then
+        printf '%-12s%-*s%-20s%-18s%s\n' PORT "$width" STATE SERVICE REASON BANNER
+    else
+        printf '%-12s%-*s%-20s%s\n' PORT "$width" STATE SERVICE BANNER
+    fi
     for row; do
-        IFS=$'\t' read -r port state banner <<<"$row"
+        IFS=$'\t' read -r port state reason banner <<<"$row"
         case $state in
             open)            ((open_count += 1)) ;;
             'open|filtered') ((openfilt_count += 1)); ((n_of > UDP_LIST_MAX)) && continue ;;
             filtered)        ((n_filt > UDP_LIST_MAX)) && continue ;;
+            error)           continue ;;
         esac
         svc=$(service_name "$port" "$PROTO"); [[ -n $svc ]] || svc=unknown
-        printf '%-12s%-*s%-20s%s\n' "$port/$PROTO" "$width" "$state" "$svc" "$banner"
+        if ((SHOW_REASON)); then
+            printf '%-12s%-*s%-20s%-18s%s\n' "$port/$PROTO" "$width" "$state" "$svc" "$reason" "$banner"
+        else
+            printf '%-12s%-*s%-20s%s\n' "$port/$PROTO" "$width" "$state" "$svc" "$banner"
+        fi
     done
 
-    [[ $PROTO == udp ]] || return 0
+    if [[ $PROTO == tcp ]]; then
+        ((closed > 0 && SHOW_REASON)) && printf 'Not shown: %d closed%s\n' "$closed" "$why"
+        return 0
+    fi
     ((n_of > UDP_LIST_MAX)) && notes+=("$n_of open|filtered (no reply)")
     ((n_filt > UDP_LIST_MAX)) && notes+=("$n_filt filtered (ICMP unreachable)")
     ((closed > 0)) && notes+=("$closed closed (ICMP port unreachable)")
+    ((n_err > 0)) && notes+=("$n_err not probed (local error: $err_reason)")
     if ((${#notes[@]})); then
         joined=$(printf '%s, ' "${notes[@]}")
         printf 'Not shown: %s\n' "${joined%, }"
@@ -815,18 +1021,40 @@ report_host() {
 }
 
 print_report() {
-    local index port state banner current=-1
-    local -a rows=()
+    local index port state reason banner current=-1 i list finished= host_why=
+    local -a rows=() ips
 
-    while IFS=$'\t' read -r index port state banner; do
+    while IFS=$'\t' read -r index port state reason banner; do
+        # track_progress's marker for a pipeline that ended early.
+        if ((index < 0)); then
+            finished=$banner
+            continue
+        fi
         if ((index != current)); then
             ((current >= 0)) && report_host "$current" "${rows[@]}"
+            # Hosts between the previous index and this one sent no rows, so
+            # no port on them answered. report_host still accounts for them.
+            host_why=
+            for ((i = current + 1; i < index; i++)); do report_host "$i"; done
             current=$index
             rows=()
         fi
-        rows+=("$port"$'\t'"$state"$'\t'"$banner")
+        # With --reason: "count reason" for this host's dropped closed ports.
+        if [[ $state == closed-why ]]; then
+            host_why+="${host_why:+, }$banner $reason"
+            continue
+        fi
+        rows+=("$port"$'\t'"$state"$'\t'"$reason"$'\t'"$banner")
     done
     ((current >= 0)) && report_host "$current" "${rows[@]}"
+    host_why=
+    for ((i = current + 1; i < ${#host_ips[@]}; i++)); do report_host "$i"; done
+
+    if ((no_open_hosts > 0 && hosts_reported > 0)); then
+        echo
+        printf '%s other host(s) had no open TCP port (closed, filtered, or host down).\n' \
+            "$no_open_hosts"
+    fi
 
     if ((silent_hosts > 0)); then
         ((hosts_reported > 0)) && echo
@@ -835,6 +1063,18 @@ print_report() {
         printf 'all %s scanned UDP port(s) on them are open|filtered.\n' "$((port_count))"
     fi
     ((open_count > 0)) || echo 'No open ports found.'
+
+    for reason in "${!unsent_hosts[@]}"; do
+        read -ra ips <<<"${unsent_hosts[$reason]}"
+        list=${ips[*]:0:8}
+        ((${#ips[@]} > 8)) && list+=" ..."
+        warn "${#ips[@]} host(s) not scanned: no probe could be sent ($reason)" "$list"
+    done
+    # A host's missing rows are read as "no port answered", which is only true
+    # if every probe reported. Say so when the pipeline stopped short.
+    [[ -z $finished ]] ||
+        warn "scan incomplete: only $finished of $((${#host_ips[@]} * port_count)) probes finished;" \
+             "ports with no result were counted as closed"
 }
 
 port_spec=
@@ -846,16 +1086,24 @@ pre_args=()
 for arg in "$@"; do
     if ((seen_dd)); then post_dd_targets+=("$arg")
     elif [[ $arg == -- ]]; then seen_dd=1
+    # The UDP flag is spelled -sU on the command line (as in nmap) and
+    # translated here into the -u that getopts handles below. -u itself, alone
+    # or in a cluster such as -uh, is not accepted from the user.
+    elif [[ $arg == -sU ]]; then pre_args+=(-u)
+    # Long option; getopts only knows single letters, so it becomes -r.
+    elif [[ $arg == --reason ]]; then pre_args+=(-r)
+    elif [[ $arg == -[!-]* && $arg == *u* ]]; then die "unknown option -u (use -sU for a UDP scan)"
     else pre_args+=("$arg"); fi
 done
 set -- "${pre_args[@]}"
 
 while (($#)); do
     OPTIND=1
-    while getopts ':p:t:j:uh' opt; do
+    while getopts ':p:t:j:urh' opt; do
         case $opt in
             p) port_spec=$OPTARG ;;
             u) PROTO=udp ;;
+            r) SHOW_REASON=1 ;;
             t) TIMEOUT=$OPTARG ;;
             j) JOBS=$OPTARG ;;
             h) usage; exit 0 ;;
@@ -895,12 +1143,13 @@ have timeout || die "'timeout' (from coreutils) is required but was not found in
 
 NC=
 NC_CONNECT_FLAG=
+NC_READ_FLAG=
 if [[ $PROTO == udp ]]; then
     have dd && have od || die "UDP scanning needs 'dd' and 'od' (from coreutils) in PATH"
-    # Workers run 'bash' from PATH, so check that one. Opening a UDP socket sends
+    # Workers run as "$BASH", so check that one. Opening a UDP socket sends
     # nothing, so this works offline; it fails only if bash was built without
     # /dev/udp support, in which case every probe would fail.
-    bash -c 'exec 3<>/dev/udp/127.0.0.1/9' 2>/dev/null ||
+    "$BASH" -c 'exec 3<>/dev/udp/127.0.0.1/9' 2>/dev/null ||
         die "UDP scanning needs bash's /dev/udp support, which this bash lacks"
     scanner=scan_port_udp
     via='bash /dev/udp'
@@ -910,8 +1159,8 @@ else
     via=${NC:-/dev/tcp}
 fi
 
-export NC NC_CONNECT_FLAG TIMEOUT BANNER_MAX HTTP_PROBE
-export -f scan_port port_is_open read_service clean_banner
+export NC NC_CONNECT_FLAG NC_READ_FLAG TIMEOUT BANNER_MAX HTTP_PROBE
+export -f scan_port port_is_open read_service clean_banner port_reason
 export -f scan_port_udp udp_payloads udp_exchange udp_error udp_banner
 
 warn "scanning ${#host_ips[@]} host(s), $((port_count)) ${PROTO^^} port(s) per host, using $via"
@@ -924,8 +1173,10 @@ open_count=0
 openfilt_count=0
 hosts_reported=0
 silent_hosts=0
+no_open_hosts=0         # TCP hosts on which no port was open
+declare -A unsent_hosts # UDP: local error reason -> " ip ip ..." never probed
 print_report < <(list_probes |
-    xargs -n 3 -P "$JOBS" bash -c "$scanner"' "$@"' _ |
+    xargs -n 3 -P "$JOBS" "$BASH" -c "$scanner"' "$@"' _ |
     track_progress "$((${#host_ips[@]} * port_count))" |
     sort -t "$(printf '\t')" -k1,1n -k2,2n)
 
