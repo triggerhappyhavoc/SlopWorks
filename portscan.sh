@@ -76,7 +76,8 @@ Targets:
 Options:
   -sU           scan UDP instead of TCP
   --reason      show why each port is in its state (as nmap --reason does):
-                a REASON column, and the reasons behind ports not shown
+                a REASON column, and for the ports not shown, each reason
+                with the ports it applies to (as ranges, e.g. 1-21,23-79)
   -t seconds    connect and banner timeout; for UDP, how long to wait for a
                 reply (default: $TIMEOUT)
   -j jobs       concurrent probes (default: $JOBS)
@@ -867,27 +868,21 @@ fmt_duration() {
 # Sits between the workers and sort. Every probe prints exactly one line, so
 # the lines read so far are the probes finished, counted as they complete
 # rather than as they are handed out. Passes every row except "closed" on to the
-# report. With SHOW_PROGRESS set, it redraws one status line on stderr at most
+# report; with --reason the closed rows go through too, because the report then
+# says which ports were closed and why. With SHOW_PROGRESS set, it redraws one status line on stderr at most
 # once a second (only when a probe finishes) and erases it at the end, so the
 # report that follows prints on a clean line.
 track_progress() {
     local total=$1 finished=0 open=0 start=$SECONDS last=-1
-    local line rest state reason key elapsed eta_text elapsed_text
-    local -A closed_why=()   # "host index<TAB>reason" -> closed ports
+    local line rest state elapsed eta_text elapsed_text
 
     ((SHOW_PROGRESS)) && trap 'printf "\r\033[K" >&2; exit 130' INT TERM
     while IFS= read -r line; do
         ((finished += 1))
         rest=${line#*$'\t'}; rest=${rest#*$'\t'}; state=${rest%%$'\t'*}
         [[ $state == open ]] && ((open += 1))
-        if [[ $state != closed ]]; then
+        if [[ $state != closed ]] || ((SHOW_REASON)); then
             printf '%s\n' "$line"
-        elif ((SHOW_REASON)); then
-            # Closed rows are dropped, but --reason reports why they were
-            # closed, so keep a count per host and reason.
-            reason=${rest#*$'\t'}; reason=${reason%%$'\t'*}
-            key=${line%%$'\t'*}$'\t'$reason
-            closed_why[$key]=$(( ${closed_why[$key]:-0} + 1 ))
         fi
 
         ((SHOW_PROGRESS)) || continue
@@ -908,12 +903,6 @@ track_progress() {
             "$open" "$elapsed_text" "$eta_text" >&2
     done
     ((SHOW_PROGRESS)) && printf '\r\033[K' >&2
-    # One "closed-why" row per host and reason: "index 0 closed-why reason count".
-    # Port 0 sorts them ahead of the host's own rows.
-    for key in "${!closed_why[@]}"; do
-        printf '%s\t0\tclosed-why\t%s\t%s\n' \
-            "${key%%$'\t'*}" "${key#*$'\t'}" "${closed_why[$key]}"
-    done
     # Workers stopped early (xargs gives up if one is killed). print_report
     # reads missing rows as closed ports, so pass it a marker row; host index
     # -1 sorts first.
@@ -921,12 +910,95 @@ track_progress() {
     return 0
 }
 
+# Every token port_reason can print, in the order the report lists them.
+REASON_ORDER='admin-prohibited conn-refused host-unreach local-error net-unreach
+no-response port-unreach proto-unreach reset unknown'
+
+# Closed-port bookkeeping for the host print_report is reading (--reason only).
+# Its rows arrive sorted by port, so each reason's ports fold into ranges as
+# they come: a port either extends the reason's current run or starts a new one.
+# The why_* arrays belong to print_report, which resets them for each host.
+closed_add() {
+    local port=$1 reason=$2
+
+    why_count[$reason]=$(( ${why_count[$reason]:-0} + 1 ))
+    if [[ -n ${why_hi[$reason]} ]] && ((port == ${why_hi[$reason]} + 1)); then
+        why_hi[$reason]=$port
+        return 0
+    fi
+    [[ -z ${why_hi[$reason]} ]] || closed_flush "$reason"
+    why_lo[$reason]=$port
+    why_hi[$reason]=$port
+}
+
+# Append a reason's current run to its range list, as "lo" or "lo-hi".
+closed_flush() {
+    local reason=$1 lo=${why_lo[$1]} hi=${why_hi[$1]}
+
+    why_ranges[$reason]+="${why_ranges[$reason]:+,}$lo"
+    ((hi > lo)) && why_ranges[$reason]+="-$hi"
+    return 0
+}
+
+# Finish the host: set $host_why ("998 conn-refused, 2 no-response") and
+# $host_why_ports (one "reason: ports" entry per reason) for report_host.
+closed_summary() {
+    local reason
+    local -A listed=()
+
+    host_why=
+    host_why_ports=()
+    for reason in $REASON_ORDER "${!why_count[@]}"; do
+        [[ -n ${why_count[$reason]} && -z ${listed[$reason]} ]] || continue
+        listed[$reason]=1
+        closed_flush "$reason"
+        host_why+="${host_why:+, }${why_count[$reason]} $reason"
+        host_why_ports+=("$reason: ${why_ranges[$reason]}")
+    done
+}
+
+# With --reason: under a "closed" summary line, say which ports each reason
+# covers, e.g. "  no-response: 1-21,23-79". Counts alone cannot be turned back
+# into a per-port picture; these lines can.
+print_why_ports() {
+    ((SHOW_REASON && ${#host_why_ports[@]})) && printf '  %s\n' "${host_why_ports[@]}"
+    return 0
+}
+
+# Print the ports of the rows in state $1, folded into ranges. The remaining
+# arguments are a host's rows, "port<TAB>state<TAB>...", sorted by port.
+state_ranges() {
+    local want=$1 row port lo= hi= out=
+    shift
+
+    for row; do
+        port=${row%%$'\t'*}
+        [[ $row == "$port"$'\t'"$want"$'\t'* ]] || continue
+        if [[ -n $hi ]] && ((port == hi + 1)); then
+            hi=$port
+            continue
+        fi
+        if [[ -n $hi ]]; then
+            out+="${out:+,}$lo"
+            ((hi > lo)) && out+="-$hi"
+        fi
+        lo=$port
+        hi=$port
+    done
+    if [[ -n $hi ]]; then
+        out+="${out:+,}$lo"
+        ((hi > lo)) && out+="-$hi"
+    fi
+    printf '%s\n' "$out"
+}
+
 # Print one host's block. Arguments after the host index are its result rows,
-# "port<TAB>state<TAB>reason<TAB>banner". track_progress has already dropped
-# closed rows, so the closed count is the number of ports scanned minus the
-# number of rows, and a host with no rows at all had no port answer. With
-# --reason, $host_why (set by print_report) says why its closed ports were
-# closed, e.g. "998 conn-refused, 2 no-response".
+# "port<TAB>state<TAB>reason<TAB>banner". Closed rows never get here
+# (track_progress drops them, or with --reason print_report folds them into
+# $host_why and $host_why_ports), so the closed count is the number of ports
+# scanned minus the number of rows, and a host with no rows at all had no port
+# answer. With --reason, $host_why says why its closed ports were closed, e.g.
+# "998 conn-refused, 2 no-response", and $host_why_ports says which ports.
 report_host() {
     local index=$1 row port state reason banner svc closed joined err_reason=
     local n_open=0 n_of=0 n_filt=0 n_err=0 width=7 why=
@@ -959,6 +1031,16 @@ report_host() {
             ((hosts_reported++)) && echo
             printf 'Scan report for %s\n' "${host_labels[index]}"
             printf 'All %d scanned TCP port(s) are closed%s\n' "$port_count" "$why"
+            print_why_ports
+        elif ((SHOW_REASON && ${#host_ips[@]} == 1)) && [[ -n $host_why ]]; then
+            # Nothing was refused either: filtered, or the host is down. With a
+            # single target there is no list of other hosts to keep short, so
+            # show what --reason asked for instead of only "No open ports found."
+            ((hosts_reported++)) && echo
+            printf 'Scan report for %s\n' "${host_labels[index]}"
+            printf 'None of the %d scanned TCP port(s) accepted or refused a connection%s\n' \
+                "$port_count" "$why"
+            print_why_ports
         else
             ((no_open_hosts += 1))
         fi
@@ -1008,6 +1090,7 @@ report_host() {
 
     if [[ $PROTO == tcp ]]; then
         ((closed > 0 && SHOW_REASON)) && printf 'Not shown: %d closed%s\n' "$closed" "$why"
+        print_why_ports
         return 0
     fi
     ((n_of > UDP_LIST_MAX)) && notes+=("$n_of open|filtered (no reply)")
@@ -1017,12 +1100,19 @@ report_host() {
     if ((${#notes[@]})); then
         joined=$(printf '%s, ' "${notes[@]}")
         printf 'Not shown: %s\n' "${joined%, }"
+        if ((SHOW_REASON)); then
+            # The ports behind each count above, so nothing is only a number.
+            ((n_of > UDP_LIST_MAX)) && printf '  open|filtered: %s\n' "$(state_ranges 'open|filtered' "$@")"
+            ((n_filt > UDP_LIST_MAX)) && printf '  filtered: %s\n' "$(state_ranges filtered "$@")"
+            print_why_ports
+        fi
     fi
 }
 
 print_report() {
     local index port state reason banner current=-1 i list finished= host_why=
-    local -a rows=() ips
+    local -a rows=() ips host_why_ports=()
+    local -A why_count=() why_ranges=() why_lo=() why_hi=()
 
     while IFS=$'\t' read -r index port state reason banner; do
         # track_progress's marker for a pipeline that ended early.
@@ -1031,23 +1121,33 @@ print_report() {
             continue
         fi
         if ((index != current)); then
-            ((current >= 0)) && report_host "$current" "${rows[@]}"
+            if ((current >= 0)); then
+                closed_summary
+                report_host "$current" "${rows[@]}"
+            fi
             # Hosts between the previous index and this one sent no rows, so
             # no port on them answered. report_host still accounts for them.
             host_why=
+            host_why_ports=()
             for ((i = current + 1; i < index; i++)); do report_host "$i"; done
             current=$index
             rows=()
+            why_count=() why_ranges=() why_lo=() why_hi=()
         fi
-        # With --reason: "count reason" for this host's dropped closed ports.
-        if [[ $state == closed-why ]]; then
-            host_why+="${host_why:+, }$banner $reason"
+        # With --reason the closed rows come through: count them per reason and
+        # fold their ports into ranges instead of listing each one.
+        if [[ $state == closed ]]; then
+            closed_add "$port" "$reason"
             continue
         fi
         rows+=("$port"$'\t'"$state"$'\t'"$reason"$'\t'"$banner")
     done
-    ((current >= 0)) && report_host "$current" "${rows[@]}"
+    if ((current >= 0)); then
+        closed_summary
+        report_host "$current" "${rows[@]}"
+    fi
     host_why=
+    host_why_ports=()
     for ((i = current + 1; i < ${#host_ips[@]}; i++)); do report_host "$i"; done
 
     if ((no_open_hosts > 0 && hosts_reported > 0)); then

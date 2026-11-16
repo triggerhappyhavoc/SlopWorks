@@ -6,7 +6,7 @@ security assessments only.
 
 CLI invocation syntax:
     quartzbreeze.py [-sT] [-sU] [-p <port-range>] <target> --scanners </path/to/scanner/list.txt>
-                    [--max-concurrent <int>]
+                    [--max-concurrent <int>] [--scan-jobs <int>] [--scan-timeout <seconds>]
 
     -sT                 Perform TCP scan. Default if neither -sT nor -sU is passed.
     -sU                 Perform UDP scan. If passed with -sT, both TCP and UDP scans are performed.
@@ -15,6 +15,8 @@ CLI invocation syntax:
     <target>            IPv4 address or hostname that the scanners will port scan.
     --scanners          Path to text file listing the scanner hosts.
     --max-concurrent    Number of scanner hosts scanning concurrently (default: 5).
+    --scan-jobs         Concurrent probes per scanner (portscan.sh -j, default 50).
+    --scan-timeout      Seconds each probe waits for an answer (portscan.sh -t, default 2).
 
 Scanner list format (one per line, '#' comments and blank lines ignored):
     user@host[:port] [/path/to/private/key]
@@ -47,6 +49,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -68,6 +71,11 @@ PROTO_FLAGS: dict[str, list[str]] = {"tcp": [], "udp": ["-sU"]}
 # Always ask for the REASON column and the "Not shown: N closed (why)" summary:
 # conn-refused vs no-response is the firewall signal this tool exists for.
 DROPPER_OPTIONS = ["--reason"]
+DROPPER_INT_MAX = 9999                     # portscan.sh accepts 1-9999 for -j and -t
+# Written into the dropper's temp dir while a scan runs: the process group to
+# kill if the scan has to be stopped (see run_dropper / remove_remote_dir).
+PID_FILE = "scan.pid"
+CANCELLED = "cancelled (run interrupted)"
 DEFAULT_SSH_PORT = 22
 DEFAULT_MAX_CONCURRENT = 5
 DEFAULT_PORT_SPEC = "1-1024"
@@ -92,12 +100,20 @@ COLUMN_GAP = "  "                          # between port-table columns
 # CIDRs, ranges and lists, which this tool deliberately does not pass through).
 IPV4_RE = re.compile(r"[0-9]{1,3}(\.[0-9]{1,3}){3}")
 HOSTNAME_RE = re.compile(r"[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9.])?")
+# Scanner-list fields end up as ssh arguments, so keep them to plain names: no
+# leading '-' (ssh would read it as an option), no whitespace or control bytes.
+SCANNER_USER_RE = re.compile(r"[A-Za-z0-9_.$\\@+][A-Za-z0-9_.$\\@+-]*")
+SCANNER_HOST_RE = re.compile(r"[A-Za-z0-9_.:%][A-Za-z0-9_.:%-]*")
 # Only paths shaped like our own mktemp -d output are ever rm -rf'd remotely.
 REMOTE_DIR_RE = re.compile(r"/[A-Za-z0-9._/-]*/quartzbreeze\.[A-Za-z0-9]{6,}")
 
 # Set on Ctrl-C so in-flight scanner jobs stop starting new scans (cleanup
 # of already-deployed droppers still runs).
 ABORT = threading.Event()
+# ssh clients that an interrupt should stop (smoke tests and scans, never
+# cleanup). See run_remote(interruptible=True) and stop_active_clients().
+ACTIVE_CLIENTS: set[subprocess.Popen] = set()
+ACTIVE_CLIENTS_LOCK = threading.Lock()
 
 # ssh stderr fragments -> friendlier explanations (checked in order)
 SSH_FAILURE_HINTS = (
@@ -169,6 +185,8 @@ class ScanConfig:
     port_spec: str                # validated -p string; passed to the dropper and
                                   # used in the output filename
     max_concurrent: int
+    scan_jobs: int | None = None      # portscan.sh -j; None -> its default (50)
+    scan_timeout: int | None = None   # portscan.sh -t; None -> its default (2s)
 
 
 @dataclass
@@ -183,6 +201,7 @@ class SmokeReport:
     ssh_ok: dict[ScannerHost, bool] = field(default_factory=dict)
     ssh_errors: dict[ScannerHost, str] = field(default_factory=dict)
     target_reachable: dict[ScannerHost, bool] = field(default_factory=dict)
+    ping_detail: dict[ScannerHost, str] = field(default_factory=dict)   # why a ping check wasn't a reply
     notes: dict[ScannerHost, list[str]] = field(default_factory=dict)  # non-fatal findings
 
     @property
@@ -196,7 +215,8 @@ class PortResult:
     """One row of portscan.sh's port table. All fields come from the dropper."""
     port: int                     # '22/tcp' -> 22
     proto: str                    # '22/tcp' -> 'tcp'
-    state: str                    # open | open|filtered | filtered
+    state: str                    # open | open|filtered | filtered (closed ports are
+                                  # not rows: the dropper's notes list them per reason)
     service: str                  # conventional service for the port, or 'unknown'
     reason: str                   # one token: syn-ack, udp-response, no-response, ...
     banner: str                   # grabbed banner (may contain spaces, may be empty)
@@ -228,6 +248,13 @@ def _positive_int(value: str) -> int:
     return n
 
 
+def _dropper_int(value: str) -> int:
+    n = _positive_int(value)
+    if n > DROPPER_INT_MAX:
+        raise argparse.ArgumentTypeError(f"must be at most {DROPPER_INT_MAX}")
+    return n
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     """Define and parse the CLI (see module docstring)."""
     parser = argparse.ArgumentParser(
@@ -248,6 +275,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--max-concurrent", type=_positive_int, default=DEFAULT_MAX_CONCURRENT,
                         metavar="N",
                         help=f"scanners working at once (default: {DEFAULT_MAX_CONCURRENT})")
+    parser.add_argument("--scan-jobs", type=_dropper_int, default=None, metavar="N",
+                        help=f"concurrent probes per scanner ({DROPPER_NAME} -j; its default "
+                             "is 50). Use a low value, e.g. 1-5, for accurate UDP results")
+    parser.add_argument("--scan-timeout", type=_dropper_int, default=None, metavar="SECONDS",
+                        help=f"seconds each probe waits for an answer ({DROPPER_NAME} -t; "
+                             "its default is 2)")
     return parser.parse_args(argv)
 
 
@@ -393,6 +426,10 @@ def parse_scanner_line(line: str) -> ScannerHost:
     if not at or not user:
         raise ValueError(f"'{parts[0]}' needs a username (user@host)")
     host, port = _split_host_port(hostport)
+    if not SCANNER_USER_RE.fullmatch(user):
+        raise ValueError(f"invalid username {user!r}")
+    if not SCANNER_HOST_RE.fullmatch(host):
+        raise ValueError(f"invalid host {host!r}")
 
     key_path = None
     if len(parts) == 2:
@@ -408,10 +445,15 @@ def load_scanners(path: str) -> list[ScannerHost]:
     QuartzError. Duplicate entries are dropped with a warning.
     """
     try:
-        with open(path, encoding="utf-8") as fh:
+        # utf-8-sig: a byte-order mark (Windows editors add one) is not part of
+        # the first username.
+        with open(path, encoding="utf-8-sig") as fh:
             lines = fh.readlines()
     except OSError as exc:
         raise QuartzError(f"Cannot read scanner list {path}: {exc.strerror}")
+    except UnicodeDecodeError as exc:
+        raise QuartzError(f"Cannot read scanner list {path}: not valid UTF-8 ({exc.reason} "
+                          f"at byte {exc.start})")
 
     scanners: list[ScannerHost] = []
     errors: list[str] = []
@@ -463,6 +505,8 @@ def build_config(args: argparse.Namespace) -> ScanConfig:
         protocols=resolve_protocols(args),
         port_spec=port_spec,
         max_concurrent=args.max_concurrent,
+        scan_jobs=args.scan_jobs,
+        scan_timeout=args.scan_timeout,
     )
 
 
@@ -506,33 +550,69 @@ def run_remote(
     scanner: ScannerHost,
     command: str,
     timeout: int | None = SSH_COMMAND_TIMEOUT,
+    interruptible: bool = False,
 ) -> RemoteResult:
     """
     Run a command on the scanner over ssh and capture rc/stdout/stderr.
     stdin is /dev/null so worker threads never read from the terminal.
     A local timeout returns returncode -1 instead of raising.
+
+    Every ssh client runs in its own session, so a Ctrl-C typed at the
+    terminal reaches this program only, not the ssh clients. That keeps
+    cleanup commands alive through an interrupt. Clients that an interrupt
+    *should* stop (smoke tests, scans) pass interruptible=True: they are
+    registered in ACTIVE_CLIENTS and terminated by stop_active_clients().
     """
     argv = ["ssh", *ssh_common_options(scanner), "-p", str(scanner.port),
             f"{scanner.username}@{scanner.host}", command]
     log.debug("[%s] $ %s", scanner.label, command)
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                            errors="replace", start_new_session=True)
+    if interruptible:
+        with ACTIVE_CLIENTS_LOCK:
+            ACTIVE_CLIENTS.add(proc)
+        if ABORT.is_set():            # the interrupt came while this client was starting
+            proc.terminate()
     try:
-        proc = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True,
-                              text=True, encoding="utf-8", errors="replace",
-                              timeout=timeout)
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
         return RemoteResult(-1, "", f"timed out after {timeout}s")
-    return RemoteResult(proc.returncode, proc.stdout, proc.stderr)
+    finally:
+        if interruptible:
+            with ACTIVE_CLIENTS_LOCK:
+                ACTIVE_CLIENTS.discard(proc)
+    return RemoteResult(proc.returncode, stdout, stderr)
+
+
+def stop_active_clients() -> None:
+    """
+    Terminate the interruptible ssh clients that are still running. Call it
+    after setting ABORT. Killing a scan's ssh client does not stop the scan:
+    without a tty nothing signals the remote processes, and the dropper would
+    keep probing the target. The scanner's worker therefore follows up with
+    remove_remote_dir(), which kills the remote process group.
+    """
+    with ACTIVE_CLIENTS_LOCK:
+        for proc in ACTIVE_CLIENTS:
+            if proc.poll() is None:
+                proc.terminate()
 
 
 def copy_to_remote(scanner: ScannerHost, local_path: str, remote_path: str) -> None:
     """scp a local file to the scanner. Raises RemoteError on failure."""
     host = f"[{scanner.host}]" if ":" in scanner.host else scanner.host
-    argv = ["scp", "-q", *ssh_common_options(scanner), "-P", str(scanner.port),
+    # No -q: scp passes it on to ssh, where it silences the very messages
+    # ("Permission denied", "Connection refused") describe_ssh_failure() reads.
+    # There is no progress meter to hide, since stdout is not a terminal.
+    argv = ["scp", *ssh_common_options(scanner), "-P", str(scanner.port),
             local_path, f"{scanner.username}@{host}:{remote_path}"]
     try:
         proc = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True,
                               text=True, encoding="utf-8", errors="replace",
-                              timeout=SCP_TIMEOUT)
+                              timeout=SCP_TIMEOUT, start_new_session=True)
     except subprocess.TimeoutExpired:
         raise RemoteError(f"upload timed out after {SCP_TIMEOUT}s")
     if proc.returncode != 0:
@@ -542,15 +622,30 @@ def copy_to_remote(scanner: ScannerHost, local_path: str, remote_path: str) -> N
 
 def remove_remote_dir(scanner: ScannerHost, remote_dir: str) -> None:
     """
-    Best-effort delete of the dropper's temp directory; logs but never
+    Best-effort cleanup of the dropper's temp directory; logs but never
     raises. Refuses any path not shaped like our own mktemp output, so a
     bad value can never turn into an rm -rf of something else.
+
+    If a scan is still running there (PID_FILE exists: the run was
+    interrupted, or the scan's ssh connection died), its process group is
+    killed first. Otherwise the dropper would carry on probing the target
+    with nobody left to read the results.
     """
     if not REMOTE_DIR_RE.fullmatch(remote_dir):
         log.warning("Refusing to delete unexpected path %r on %s - check it manually.",
                     remote_dir, scanner.label)
         return
-    result = run_remote(scanner, f"rm -rf -- {shlex.quote(remote_dir)}")
+    # 'kill -TERM -<pgid>' is the form dash, bash and BusyBox ash all accept
+    # (dash rejects 'kill -TERM -- -<pgid>'). The fallback covers a scanner
+    # where the group could not be read and PID_FILE holds a plain pid.
+    script = (
+        f"d={shlex.quote(remote_dir)}; "
+        f'p=$(cat "$d/{PID_FILE}" 2>/dev/null); '
+        'case $p in ""|*[!0-9]*|0|1) ;; '
+        '*) kill -TERM "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null ;; esac; '
+        'rm -rf -- "$d"'
+    )
+    result = run_remote(scanner, f"sh -c {shlex.quote(script)}")
     if result.returncode != 0:
         log.warning("Could not remove %s from %s (%s) - remove it manually.",
                     remote_dir, scanner.label, describe_ssh_failure(result))
@@ -582,7 +677,7 @@ def smoke_test_scanner(scanner: ScannerHost, protocols: list[str]) -> tuple[bool
         "if [ -x ./nc ]; then echo NC:./nc; "
         "else echo \"NC:$(command -v nc || command -v ncat || command -v netcat)\"; fi"
     )
-    result = run_remote(scanner, f"sh -c {shlex.quote(script)}")
+    result = run_remote(scanner, f"sh -c {shlex.quote(script)}", interruptible=True)
     if result.returncode != 0:
         return False, describe_ssh_failure(result), []
 
@@ -608,33 +703,66 @@ def smoke_test_scanner(scanner: ScannerHost, protocols: list[str]) -> tuple[bool
     return True, "", notes
 
 
-def smoke_test_target(scanner: ScannerHost, target: Target) -> bool:
-    """ICMP ping the target from the scanner (ping -c1 -W PING_TIMEOUT)."""
-    command = f"ping -c 1 -W {PING_TIMEOUT} {shlex.quote(target.address)} >/dev/null 2>&1"
-    result = run_remote(scanner, command, timeout=SSH_COMMAND_TIMEOUT + PING_TIMEOUT)
-    return result.returncode == 0
+def smoke_test_target(scanner: ScannerHost, target: Target) -> tuple[bool, str]:
+    """
+    ICMP ping the target from the scanner (ping -c1 -W PING_TIMEOUT).
+    Returns (replied, detail). detail is empty on a reply; otherwise it says
+    which of four different things happened, because only one of them is
+    about the network: no reply, ping not installed, ping itself failed
+    (cannot resolve the name, not permitted), or the check never ran.
+    """
+    script = (
+        "command -v ping >/dev/null 2>&1 || { echo PING:missing; exit 0; }; "
+        f"ping -c 1 -W {PING_TIMEOUT} {shlex.quote(target.address)} >/dev/null 2>&1; "
+        'echo "PING:$?"'
+    )
+    result = run_remote(scanner, f"sh -c {shlex.quote(script)}",
+                        timeout=SSH_COMMAND_TIMEOUT + PING_TIMEOUT, interruptible=True)
+    if result.returncode != 0:
+        return False, f"ping check did not run ({describe_ssh_failure(result)})"
+    status = ""
+    for line in result.stdout.splitlines():   # tagged, so profile noise is ignored
+        if line.startswith("PING:"):
+            status = line[len("PING:"):].strip()
+    if status == "0":
+        return True, ""
+    if status == "1":
+        return False, "no ping reply (ICMP may be filtered)"
+    if status == "missing":
+        return False, "target not pinged: ping is not installed on the scanner"
+    return False, (f"target not pinged: ping failed with status {status or 'unknown'} "
+                   "(target name not resolvable there, or ping not permitted)")
 
 
-def _smoke_one(scanner: ScannerHost, config: ScanConfig) -> tuple[bool, str, list[str], bool | None]:
+def _smoke_one(scanner: ScannerHost, config: ScanConfig) -> tuple[bool, str, list[str], bool, str]:
     ok, error, notes = smoke_test_scanner(scanner, config.protocols)
-    reachable = smoke_test_target(scanner, config.target) if ok else None
-    return ok, error, notes, reachable
+    reachable, ping_detail = smoke_test_target(scanner, config.target) if ok else (False, "")
+    return ok, error, notes, reachable, ping_detail
 
 
 def run_smoke_tests(config: ScanConfig) -> SmokeReport:
     """
     Smoke test every scanner in parallel (bounded by max_concurrent): SSH +
     dependency check first, then the target ping from scanners that passed.
+    On Ctrl-C the running checks are stopped and the queued ones dropped.
     """
     print(f"Smoke testing {len(config.scanners)} scanner(s)...")
-    with ThreadPoolExecutor(max_workers=config.max_concurrent) as pool:
+    pool = ThreadPoolExecutor(max_workers=config.max_concurrent)
+    try:
         outcomes = list(pool.map(lambda s: _smoke_one(s, config), config.scanners))
+    except KeyboardInterrupt:
+        ABORT.set()
+        stop_active_clients()
+        raise
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
 
     report = SmokeReport()
-    for scanner, (ok, error, notes, reachable) in zip(config.scanners, outcomes):
+    for scanner, (ok, error, notes, reachable, ping_detail) in zip(config.scanners, outcomes):
         report.ssh_ok[scanner] = ok
         if ok:
-            report.target_reachable[scanner] = bool(reachable)
+            report.target_reachable[scanner] = reachable
+            report.ping_detail[scanner] = ping_detail
             report.notes[scanner] = notes
         else:
             report.ssh_errors[scanner] = error
@@ -644,7 +772,8 @@ def run_smoke_tests(config: ScanConfig) -> SmokeReport:
 def print_smoke_report(report: SmokeReport, target: Target) -> None:
     """
     Per-scanner summary: SSH status (+ error) and ping status.
-    Ping failures are flagged as warnings ("ICMP may be filtered"), not errors.
+    Ping failures are flagged as warnings, not errors, and say whether there
+    was no reply or the ping could not be run at all.
     """
     print(f"\nSmoke test results (target: {target.label})")
     width = max(len(s.label) for s in report.ssh_ok)
@@ -654,7 +783,8 @@ def print_smoke_report(report: SmokeReport, target: Target) -> None:
         elif report.target_reachable.get(scanner):
             status, detail = " OK ", "SSH ok, target replied to ping"
         else:
-            status, detail = "WARN", "SSH ok, no ping reply (ICMP may be filtered; scanner will still be used)"
+            why = report.ping_detail.get(scanner) or "no ping reply (ICMP may be filtered)"
+            status, detail = "WARN", f"SSH ok, {why}; scanner will still be used"
         print(f"  [{status}] {scanner.label:<{width}}  {detail}")
         for note in report.notes.get(scanner, []):
             print(f"         {'':<{width}}  note: {note}")
@@ -714,22 +844,44 @@ def deploy_dropper(scanner: ScannerHost) -> str:
 def run_dropper(
     scanner: ScannerHost,
     remote_dir: str,
-    target: Target,
+    config: ScanConfig,
     proto: str,
-    port_spec: str,
 ) -> RemoteResult:
     """
-    Invoke: bash <remote_dir>/portscan.sh --reason [-sU] -p<port_spec> <target>
+    Invoke: bash <remote_dir>/portscan.sh --reason [-sU] [-j N] [-t S] -p<port_spec> <target>
     It runs from the SSH login directory (not the temp dir), so a static nc
     the operator placed there is picked up as portscan.sh intends.
     Arguments are shell-quoted since they travel through the remote shell.
+
+    The dropper is wrapped in a small sh script that records its process
+    group in <remote_dir>/PID_FILE for the duration of the scan, which is
+    what lets remove_remote_dir() stop a scan whose ssh client is gone. The
+    group comes from ps, or from /proc/<pid>/stat where ps can't say
+    (BusyBox); failing both, the wrapper's own pid is recorded instead.
+
     No timeout: scan duration depends on the port range.
     Returns the RemoteResult (stdout = report, stderr = dropper log).
-    Raises RemoteError on non-zero exit, quoting the dropper's own messages.
+    Raises RemoteError on non-zero exit, quoting the dropper's own messages,
+    or RemoteError(CANCELLED) if the run was interrupted.
     """
-    argv = ["bash", f"{remote_dir}/{DROPPER_NAME}", *DROPPER_OPTIONS, *PROTO_FLAGS[proto],
-            f"-p{port_spec}", target.address]
-    result = run_remote(scanner, " ".join(shlex.quote(a) for a in argv), timeout=None)
+    argv = ["bash", f"{remote_dir}/{DROPPER_NAME}", *DROPPER_OPTIONS, *PROTO_FLAGS[proto]]
+    if config.scan_jobs is not None:
+        argv += ["-j", str(config.scan_jobs)]
+    if config.scan_timeout is not None:
+        argv += ["-t", str(config.scan_timeout)]
+    argv += [f"-p{config.port_spec}", config.target.address]
+    dropper = " ".join(shlex.quote(a) for a in argv)
+    pid_file = shlex.quote(f"{remote_dir}/{PID_FILE}")
+    script = (
+        'pg=$(ps -o pgid= -p $$ 2>/dev/null | tr -d " "); '
+        # BusyBox ps has no -p: read the group from /proc (field 3 after the "(comm) ").
+        "[ -n \"$pg\" ] || pg=$(awk '{ sub(/.*\\) /, \"\"); print $3 }' /proc/$$/stat 2>/dev/null); "
+        f'echo "${{pg:-$$}}" > {pid_file}; '
+        f"{dropper}; rc=$?; rm -f {pid_file}; exit $rc"
+    )
+    result = run_remote(scanner, f"sh -c {shlex.quote(script)}", timeout=None, interruptible=True)
+    if result.returncode != 0 and ABORT.is_set():
+        raise RemoteError(CANCELLED)
     if result.returncode == 255:
         raise RemoteError(f"ssh failed during scan: {describe_ssh_failure(result)}")
     if result.returncode != 0:
@@ -744,27 +896,33 @@ def scan_from_scanner(scanner: ScannerHost, config: ScanConfig) -> list[ScanResu
     One scanner's whole job: deploy the dropper once, run it once per
     protocol, parse output, then delete the dropper after all of this
     scanner's scans are done (finally: remove_remote_dir, so it also runs on
-    error). Errors are captured into ScanResult.error rather than raised, so
-    one bad scanner never aborts the run.
+    error, and stops a scan that is still running there). Errors are captured
+    into ScanResult.error rather than raised, so one bad scanner never aborts
+    the run.
     """
+    if ABORT.is_set():
+        return [ScanResult(scanner, proto, error=CANCELLED) for proto in config.protocols]
     try:
         remote_dir = deploy_dropper(scanner)
     except QuartzError as exc:
         return [ScanResult(scanner, proto, error=f"deploy failed: {exc}")
                 for proto in config.protocols]
 
+    # If the name didn't resolve locally, each scanner resolves it for itself:
+    # keep the dropper's line saying which address this one actually scanned.
+    keep_target_line = config.target.ip is None
     results = []
     try:
         for proto in config.protocols:
             if ABORT.is_set():
-                results.append(ScanResult(scanner, proto, error="cancelled"))
+                results.append(ScanResult(scanner, proto, error=CANCELLED))
                 continue
             try:
-                result = run_dropper(scanner, remote_dir, config.target, proto, config.port_spec)
+                result = run_dropper(scanner, remote_dir, config, proto)
             except QuartzError as exc:
                 results.append(ScanResult(scanner, proto, error=str(exc)))
                 continue
-            ports, notes = parse_dropper_output(result.stdout)
+            ports, notes = parse_dropper_output(result.stdout, keep_target_line)
             results.append(ScanResult(scanner, proto, ports=ports,
                                       notes=notes + dropper_log(result.stderr)))
     finally:
@@ -772,13 +930,31 @@ def scan_from_scanner(scanner: ScannerHost, config: ScanConfig) -> list[ScanResu
     return results
 
 
-def run_scans(config: ScanConfig, report: SmokeReport) -> list[ScanResult]:
+def _future_results(future, scanner: ScannerHost, config: ScanConfig) -> list[ScanResult]:
+    """A finished (or cancelled) scanner job as ScanResults; never raises."""
+    if future.cancelled():
+        return [ScanResult(scanner, p, error=CANCELLED) for p in config.protocols]
+    try:
+        return future.result()
+    except Exception as exc:   # bug guard: one scanner must not sink the run
+        log.debug("Unexpected error on %s", scanner.label, exc_info=True)
+        return [ScanResult(scanner, p, error=f"unexpected error: {exc}")
+                for p in config.protocols]
+
+
+def run_scans(config: ScanConfig, report: SmokeReport) -> tuple[list[ScanResult], bool]:
     """
     ThreadPoolExecutor(max_workers=config.max_concurrent) over
     report.healthy_scanners, each running scan_from_scanner.
-    Prints progress as each scanner completes. On Ctrl-C, queued scanners are
-    cancelled and running ones finish cleanup before the interrupt propagates.
-    Results are returned in scanner-list order.
+    Prints progress as each scanner completes.
+
+    On Ctrl-C: queued scanners are cancelled, the ssh clients of running
+    scans are terminated, and each running worker then kills its scan on the
+    scanner and deletes its dropper. This function waits for that cleanup
+    (further Ctrl-Cs don't cut it short) and still returns what was
+    collected, so finished scanners are reported.
+
+    Returns (results in scanner-list order, interrupted).
     """
     scanners = report.healthy_scanners
     protocols = "+".join(p.upper() for p in config.protocols)
@@ -786,37 +962,47 @@ def run_scans(config: ScanConfig, report: SmokeReport) -> list[ScanResult]:
           f"from {len(scanners)} scanner(s), up to {config.max_concurrent} at once...")
 
     by_scanner: dict[ScannerHost, list[ScanResult]] = {}
+    interrupted = False
     pool = ThreadPoolExecutor(max_workers=config.max_concurrent)
+    futures = {pool.submit(scan_from_scanner, s, config): s for s in scanners}
     try:
-        futures = {pool.submit(scan_from_scanner, s, config): s for s in scanners}
         for done, future in enumerate(as_completed(futures), start=1):
             scanner = futures[future]
-            try:
-                results = future.result()
-            except Exception as exc:   # bug guard: one scanner must not sink the run
-                log.debug("Unexpected error on %s", scanner.label, exc_info=True)
-                results = [ScanResult(scanner, p, error=f"unexpected error: {exc}")
-                           for p in config.protocols]
+            results = _future_results(future, scanner, config)
             by_scanner[scanner] = results
             failed = [r.proto.upper() for r in results if r.error]
             status = "done" if not failed else f"{'/'.join(failed)} scan failed"
             print(f"  [{done}/{len(scanners)}] {scanner.label}: {status}")
     except KeyboardInterrupt:
+        interrupted = True
         ABORT.set()
-        print("\nInterrupted - cleaning up droppers on scanners...", file=sys.stderr)
-        pool.shutdown(wait=True, cancel_futures=True)
-        raise
-    finally:
-        pool.shutdown(wait=True)
+        print("\nInterrupted - stopping scans and removing droppers on scanners...",
+              file=sys.stderr)
+        stop_active_clients()
 
-    return [r for s in scanners for r in by_scanner[s]]
+    while True:
+        try:
+            pool.shutdown(wait=True, cancel_futures=interrupted)
+            break
+        except KeyboardInterrupt:
+            if not interrupted:
+                interrupted = True
+                ABORT.set()
+                stop_active_clients()
+            print("Still stopping scans and removing droppers - please wait...",
+                  file=sys.stderr)
+
+    for future, scanner in futures.items():
+        if scanner not in by_scanner:
+            by_scanner[scanner] = _future_results(future, scanner, config)
+    return [r for s in scanners for r in by_scanner[s]], interrupted
 
 
 # ---------------------------------------------------------------------------
 # 5. Parsing & reporting
 # ---------------------------------------------------------------------------
 
-def parse_dropper_output(stdout: str) -> tuple[list[PortResult], list[str]]:
+def parse_dropper_output(stdout: str, keep_target_line: bool = False) -> tuple[list[PortResult], list[str]]:
     """
     Parse portscan.sh's stdout (run with --reason). Real output looks like:
         Scan report for 10.0.0.5
@@ -829,14 +1015,25 @@ def parse_dropper_output(stdout: str) -> tuple[list[PortResult], list[str]]:
         No open ports found.
     Returns (ports, notes): port rows become PortResults; every other
     non-blank line except the 'Scan report for' and table header lines is
-    kept verbatim as a note, since those lines describe the closed/filtered
-    ports. A port-shaped row that fails to parse is logged and kept as a note.
+    kept as a note, since those lines describe the closed/filtered ports.
+    Notes keep their leading indentation: the dropper indents the
+    'reason: ports' lines under the summary line they belong to.
+    A port-shaped row that fails to parse is logged and kept as a note.
+
+    keep_target_line: also keep 'Scan report for <name> (<ip>)', as the first
+    note. Used when the target name could not be resolved locally, where that
+    line is the only record of the address this scanner really scanned.
     """
     ports: list[PortResult] = []
     notes: list[str] = []
     for line in stdout.splitlines():
         text = line.strip()
-        if not text or text.startswith("Scan report for ") or is_table_header(text):
+        if not text or is_table_header(text):
+            continue
+        if text.startswith("Scan report for "):
+            if keep_target_line:
+                notes.insert(0, "Target as resolved by this scanner: "
+                                + text[len("Scan report for "):])
             continue
         if PORT_FIELD_RE.fullmatch(text.split(maxsplit=1)[0]):
             try:
@@ -844,7 +1041,7 @@ def parse_dropper_output(stdout: str) -> tuple[list[PortResult], list[str]]:
                 continue
             except ValueError as exc:
                 log.warning("Unparseable dropper row %r: %s", text, exc)
-        notes.append(text)
+        notes.append(line.rstrip())
     return ports, notes
 
 
@@ -1013,22 +1210,51 @@ def build_output_filename(config: ScanConfig) -> str:
     return f"quartzbreeze-{safe(config.target.raw)}-{safe(ports)[:60]}.txt"
 
 
-def write_report(text: str, path: str) -> None:
-    """Write the report to disk. Raises QuartzError on failure."""
-    try:
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(text)
-    except OSError as exc:
-        raise QuartzError(f"Could not write report to {path}: {exc.strerror}")
+def write_report(text: str, path: str) -> str:
+    """
+    Write the report to disk and return the path used. An existing report is
+    never overwritten: if 'name.txt' exists, 'name-2.txt', 'name-3.txt', ...
+    is used instead (a TCP run and a UDP run of the same target and ports
+    share a name, as do port specs that only differ after the 60-character
+    cut). Raises QuartzError on failure.
+    """
+    stem, ext = os.path.splitext(path)
+    candidate, attempt = path, 1
+    while True:
+        try:
+            with open(candidate, "x", encoding="utf-8") as fh:
+                fh.write(text)
+            return candidate
+        except FileExistsError:
+            attempt += 1
+            candidate = f"{stem}-{attempt}{ext}"
+        except OSError as exc:
+            raise QuartzError(f"Could not write report to {candidate}: {exc.strerror}")
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _raise_keyboard_interrupt(signum, frame) -> None:
+    raise KeyboardInterrupt
+
+
+def _on_hangup(signum, frame) -> None:
+    """The terminal went away (window closed, SSH session dropped)."""
+    # Writing to it would now fail and cut the cleanup short, so discard
+    # output first; the report file is still written.
+    sys.stdout = sys.stderr = open(os.devnull, "w")
+    raise KeyboardInterrupt
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     args = parse_args(argv if argv is not None else sys.argv[1:])
+    # 'kill <pid>' and a lost terminal get the same treatment as Ctrl-C: stop
+    # the scans and remove the droppers instead of leaving both behind.
+    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+    signal.signal(signal.SIGHUP, _on_hangup)
     try:
         check_local_dependencies()
         config = build_config(args)
@@ -1038,13 +1264,18 @@ def main(argv: list[str] | None = None) -> int:
         if not prompt_continue(report):
             return 1
 
-        results = run_scans(config, report)
+        results, interrupted = run_scans(config, report)
 
         text = format_report(config, results, report.ssh_errors)
         print("\n" + text)
-        path = build_output_filename(config)
-        write_report(text, path)
+        path = write_report(text, build_output_filename(config))
         print(f"Report saved to {path}")
+        if interrupted:
+            print("Interrupted: the report above is partial.", file=sys.stderr)
+            return 130
+        if all(result.error for result in results):
+            log.error("No scan completed - see the report for the reason each one failed.")
+            return 1
     except QuartzError as exc:
         log.error("%s", exc)
         return 2
